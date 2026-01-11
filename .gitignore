@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+venv/
+env/
+.idea/
+.vscode/
+backups/
+hvp/
+*.log
+*.hvp
+*.lock
+*.writelock
+users_dump.json
+# Ignore plugin directories as they are separate repos
+hvpdb-admin/
+hvpdb-backup/
+hvpdb-http/
+hvpdb-migrate/
+hvpdb-observe/
+hvpdb-perms/
+hvpdb-query/
+hvpdb-sync/
+hvpdb-tools/

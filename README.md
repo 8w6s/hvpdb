@@ -4,12 +4,16 @@
 
 [![PyPI version](https://badge.fury.io/py/hvpdb.svg)](https://badge.fury.io/py/hvpdb)
 [![Python Versions](https://img.shields.io/pypi/pyversions/hvpdb.svg)](https://pypi.org/project/hvpdb/)
-[![License](https://img.shields.io/badge/License-Proprietary-red.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 **The Secure, Embedded, NoSQL Database for Modern Python Apps.**
 
-[Features](#key-features) • [Installation](#installation) • [Quick Start](#quick-start) • [CLI Power](#cli-power) • [Benchmarks](#benchmarks)
+[Overview](#-what-is-hvpdb) •
+[Concepts](#-core-concepts-important--read-this-first) •
+[Installation](#-installation) •
+[Quick Start](#-quick-start-python-api) •
+[Benchmarks](#-benchmarks)
 
 </div>
 
@@ -17,131 +21,259 @@
 
 ## 🚀 What is HVPDB?
 
-**HVPDB** is a high-performance, embedded NoSQL database designed for Python applications that require **speed**, **security**, and **reliability** without the overhead of a dedicated server (like MongoDB or PostgreSQL).
+**HVPDB** is a **local-first, embedded NoSQL database** for Python.
 
-It combines the simplicity of SQLite with the flexibility of Document Stores, powered by modern tech stack: **MsgPack** serialization, **ZStandard** compression, and **AES-GCM** encryption.
+It is designed for developers who want:
 
-> "Think of it as SQLite met MongoDB, got married, and went to the gym." 💪
+- A **simple database they fully control**
+- **Strong encryption by default**
+- **High-speed local reads/writes**
+- No external DB server (no MongoDB / Postgres daemon)
 
-## ✨ Key Features
+HVPDB combines ideas from:
 
-- **🔒 Military-Grade Security:** Native AES-256-GCM encryption at rest. Your data is encrypted before it touches the disk.
-- **⚡ Blazing Fast:** Optimized Write-Ahead Log (WAL) v2 with batched commits and ZStandard compression.
-- **📦 Transaction Support:**
-Atomic and consistent transactions with WAL-backed commit and rollback.
-Designed for local and embedded workloads.
-- **🐚 Power Ops Shell:** Interactive CLI with syntax highlighting, auto-completion, and live data inspection.
-- **🕸️ Thread-Safe:** Built with `contextvars` for safe concurrency in AsyncIO/FastAPI/Flask environments.
-- **🔍 Smart Query Optimizer:** Uses Set Intersection algorithms for O(1) lookups on indexed fields.
-- **🌐 HTTP Server:** Built-in REST API server to expose your DB over the network instantly.
+- **SQLite** → embedded, file-based  
+- **MongoDB** → document-oriented  
+- **Linux tools** → CLI-first workflow  
 
-## 📦 Installation
+Under the hood, it uses:
 
-```bash
-pip install hvpdb
-```
+- **MsgPack** for fast serialization  
+- **ZStandard** for compression  
+- **AES-256-GCM** for authenticated encryption  
 
-## ⚡ Quick Start (Python API)
+> *A private, encrypted data store you ship with your app.*
+
+---
+
+## 🧠 Core Concepts (Important – Read This First)
+
+### 1. Embedded, Not a Server
+
+HVPDB runs **inside your Python process**.
+
+- ❌ No background daemon  
+- ❌ No TCP port unless you explicitly `deploy`  
+- ✅ Just a file + Python API  
 
 ```python
 from hvpdb import HVPDB
+db = HVPDB("mydb", password="secret")
+```
 
-# 1. Connect (Auto-creates ./hvp/mydb/mydb.hvp)
+---
+
+### 2. Group ≠ Collection ≠ Table
+
+HVPDB intentionally avoids SQL/Mongo terminology.
+
+HVPDB Term	Meaning
+
+Database	A folder containing encrypted files
+Group	A logical set of documents
+Document	A Python dict with _id
+
+```python
+users = db.group("users")
+users.insert({"name": "Alice"})
+```
+
+---
+
+### 3. Memory-First, Disk-Safe
+
+Reads are memory-first → extremely fast
+
+Writes go through WAL (Write-Ahead Log)
+
+Disk data is always encrypted
+
+
+Result:
+
+Fast developer experience
+
+Safe crash recovery
+
+Predictable performance
+
+
+
+---
+
+### 4. Two Ways to Use HVPDB
+
+Mode	Purpose
+
+Python API	Application logic
+HVPShell	Human interaction, debugging, inspection
+
+
+> HVPShell is a database editor, not the database itself.
+
+
+
+
+---
+
+✨ Key Features
+
+🔒 Encryption by Default
+AES-256-GCM encryption at rest.
+
+⚡ High Performance
+WAL v2, batched commits, compressed storage.
+
+📦 Transactions (ACID)
+Atomic commits with rollback support.
+
+🐚 HVPShell (Ops Shell)
+Interactive CLI with:
+
+auto-complete
+
+rich tables
+
+schema inference
+
+audit & history tools
+
+
+🕸️ Thread-Safe
+Safe for FastAPI / AsyncIO / Flask via contextvars.
+
+🌐 Optional HTTP Server
+Expose your DB via REST when needed.
+
+
+
+---
+
+## 📦 Installation
+```python
+pip install hvpdb
+```
+
+---
+
+## ⚡ Quick Start (Python API)
+```python
+from hvpdb import HVPDB
+
 db = HVPDB("mydb", password="super_secret_key")
 
-# 2. Get a Group (Collection)
 users = db.group("users")
 
-# 3. Insert Data (Atomic & Durable)
 users.insert({
     "name": "Alice",
     "email": "alice@example.com",
-    "role": "admin",
-    "stats": {"login_count": 42}
+    "role": "admin"
 })
 
-# 4. Create Index (Unique Constraint)
 users.create_index("email", unique=True)
 
-# 5. Fast Query
 admin = users.find_one({"role": "admin"})
-print(f"Found admin: {admin['name']}")
+print(admin["name"])
 
-# 6. Transaction (ACID)
-with db.begin() as txn:
+with db.begin():
     users.insert({"name": "Bob"})
     users.insert({"name": "Charlie"})
-    # If code fails here, Bob and Charlie are rolled back!
 
 db.close()
 ```
 
+---
+
 ## 🖥️ CLI Power (HVPShell)
 
-HVPDB comes with a beautiful, rich-text terminal interface.
-
-**1. Initialize a Database:**
+Initialize database
 ```bash
 hvpdb init my_project "secret123"
 ```
-
-**2. Enter the Shell:**
+Enter shell
 ```bash
 hvpdb shell my_project "secret123"
 ```
-
-**3. Interactive Magic:**
+Example workflow
 ```bash
-hvpdb [my_project] > target users
-hvpdb [my_project] [users] > make name="Dave" role="dev"
-hvpdb [my_project] [users] > hunt role="dev"
-hvpdb [my_project] [users] > peek full
-hvpdb [my_project] [users] > stats login_count
+target users
+make name="Dave" role="dev"
+hunt role="dev"
+peek
+stats login_count
 ```
-
-**4. Instant API Server:**
+Deploy as API (optional)
 ```bash
 hvpdb deploy my_project 8080
-# Serving HTTP API at http://0.0.0.0:8080 🚀
 ```
+
+---
 
 ## 📊 Benchmarks
 
-Running on standard hardware (NVMe SSD, Ryzen 7):
+Running on mid-range hardware (Ryzen 7, NVMe SSD):
 
-| Operation | Ops/Sec | Note |
-|-----------|---------|------|
-| **Write** | ~14,000 | Batched WAL Commit |
-| **Read**  | ~500k+  | Memory-mapped + Cache |
-| **Index** | O(1)    | Hash Map Lookup |
+| Operation | Ops/Sec      | Note                  |
+|-----------|--------------|-----------------------|
+| Write     | ~14,000      | Batched WAL Commit    |
+| Read      | ~500k+       | Memory-first Cache    |
+| Index Lookup | O(1)      | Hash Map              |
 
-*> Benchmarks generated using `hvpdb shell > benchmark`*
+*Generated via `hvpdb shell > benchmark`*
+
+
+---
 
 ## 📂 Project Structure
-
-When you initialize a database named `myapp`, HVPDB keeps it organized locally:
-
-```text
+```
 ./hvp/
   └── myapp/
-      ├── myapp.hvp          # Main Data File (Encrypted & Compressed)
-      ├── myapp.hvp.log      # Write-Ahead Log (Crash Recovery)
-      ├── myapp.hvp.lock     # Process Lock
+      ├── myapp.hvp          # Encrypted data
+      ├── myapp.hvp.log      # WAL
+      ├── myapp.hvp.lock
       └── myapp.hvp.writelock
 ```
+Each database lives in its own folder for clarity and isolation.
+
+
+---
+
 ## 👥 Who is HVPDB for?
 
-- Solo developers & indie hackers
-- Small to medium backend teams
+- Solo developers
+
+- Indie hackers
+
+- Internal tools
+
+- Security-sensitive apps
+
 - CLI-first workflows
-- Local-first apps
-- Embedded tools & internal services
 
-## 📜 License
 
-**Proprietary / Closed Source**
-- ✅ Free for personal and commercial usage in your projects.
-- ❌ **No Forking:** You may not redistribute modified source code.
-- ❌ **No Resale:** You may not sell this software as a standalone product.
+**Not designed for:**
 
-Copyright © 2026 8w6s. All rights reserved.
+- Massive distributed clusters
+
+- Multi-terabyte analytics
+
+- Replacing PostgreSQL at scale
+
+
+
+---
+
+📜 License
+
+Apache License 2.0
+
+✅ Free for personal and commercial use
+
+✅ Modification and redistribution allowed
+
+❗ You may NOT use the name HVPDB, logo, or branding to promote derived products
+
+
+See LICENSE and TRADEMARK.md for details.
+
+Copyright © 2026 8w6s
