@@ -10,10 +10,12 @@ env/
 .vscode/
 backups/
 hvp/
+tests/
 *.log
 *.hvp
 *.lock
 *.writelock
+*.zip
 users_dump.json
 # Ignore plugin directories as they are separate repos
 hvpdb-admin/
