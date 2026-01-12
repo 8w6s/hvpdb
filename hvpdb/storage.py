@@ -174,7 +174,10 @@ class HVPStorage:
                     f.write(nonce)
                     f.write(ciphertext)
                     f.flush()
-                    os.fsync(f.fileno())
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
                 finally:
                     portalocker.unlock(f)
             with self.lock_manager.critical_swap_lock():

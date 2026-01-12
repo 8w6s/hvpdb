@@ -73,7 +73,10 @@ class HVPWAL:
             f.write(len(kdf_bytes).to_bytes(2, 'big'))
             f.write(kdf_bytes)
             f.flush()
-            os.fsync(f.fileno())
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
 
     def _write_entry(self, entry: dict, sync: bool=True):
         if self.security:
@@ -92,7 +95,10 @@ class HVPWAL:
         f.write(ciphertext)
         if sync:
             f.flush()
-            os.fsync(f.fileno())
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
 
     def write_batch(self, entries: List[dict], sync: bool=True):
         if not entries:
@@ -114,7 +120,10 @@ class HVPWAL:
             f.write(ciphertext)
         if sync:
             f.flush()
-            os.fsync(f.fileno())
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
 
     def begin_transaction(self) -> str:
         return str(uuid.uuid4())
@@ -259,4 +268,7 @@ class HVPWAL:
             f.write(len(kdf_bytes).to_bytes(2, 'big'))
             f.write(kdf_bytes)
             f.flush()
-            os.fsync(f.fileno())
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
