@@ -32,7 +32,7 @@ def get_auth(authorization: Optional[str]=Header(None), x_hvp_key: Optional[str]
 
 @app.get('/')
 def read_root():
-    return {'server': 'HVPDB', 'status': 'running', 'version': '1.0.1'}
+    return {'server': 'HVPDB', 'status': 'running', 'version': '1.0.2'}
 
 @app.get('/groups', dependencies=[Depends(get_auth)])
 def list_groups():
