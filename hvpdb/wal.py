@@ -25,7 +25,11 @@ class HVPWAL:
     def _open_log(self):
         if self._file_handle is None:
             self._file_handle = open(self.log_path, 'ab')
-            portalocker.lock(self._file_handle, portalocker.LOCK_EX)
+            try:
+                portalocker.lock(self._file_handle, portalocker.LOCK_EX)
+            except OSError:
+                # Some filesystems (e.g. some Docker mounts) do not support locking
+                pass
 
     def close(self):
         if self._file_handle:
@@ -168,7 +172,10 @@ class HVPWAL:
         replayed_count = 0
         txn_buffer: Dict[str, List[dict]] = {}
         with open(self.log_path, 'rb') as f:
-            portalocker.lock(f, portalocker.LOCK_SH)
+            try:
+                portalocker.lock(f, portalocker.LOCK_SH)
+            except OSError:
+                pass
             try:
                 header_magic = f.read(6)
                 if header_magic == WAL_MAGIC:
@@ -235,7 +242,10 @@ class HVPWAL:
                         warnings.warn(f'WAL Entry Decryption failed: {e}')
                         break
             finally:
-                portalocker.unlock(f)
+                try:
+                    portalocker.unlock(f)
+                except OSError:
+                    pass
         return replayed_count
 
     def truncate(self):
@@ -245,13 +255,19 @@ class HVPWAL:
             f.truncate(0)
         else:
             with open(self.log_path, 'a+b') as f:
-                portalocker.lock(f, portalocker.LOCK_EX)
+                try:
+                    portalocker.lock(f, portalocker.LOCK_EX)
+                except OSError:
+                    pass
                 try:
                     f.seek(0)
                     f.truncate(0)
                     self._write_header_to_handle(f)
                 finally:
-                    portalocker.unlock(f)
+                    try:
+                        portalocker.unlock(f)
+                    except OSError:
+                        pass
             return
         self._write_header_to_handle(f)
 

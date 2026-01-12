@@ -50,7 +50,10 @@ class HVPStorage:
         if not os.path.exists(self.log_path):
             with open(self.log_path, 'wb') as f:
                 pass
-            os.chmod(self.log_path, 384)
+            try:
+                os.chmod(self.log_path, 384)
+            except OSError:
+                pass
         else:
             try:
                 os.chmod(self.log_path, 384)
@@ -164,7 +167,10 @@ class HVPStorage:
             temp_path = self.filepath + '.tmp'
             fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 384)
             with os.fdopen(fd, 'wb') as f:
-                portalocker.lock(f, portalocker.LOCK_EX)
+                try:
+                    portalocker.lock(f, portalocker.LOCK_EX)
+                except OSError:
+                    pass
                 try:
                     f.write(HEADER)
                     f.write(VERSION.to_bytes(2, 'big'))
@@ -179,7 +185,10 @@ class HVPStorage:
                     except OSError:
                         pass
                 finally:
-                    portalocker.unlock(f)
+                    try:
+                        portalocker.unlock(f)
+                    except OSError:
+                        pass
             with self.lock_manager.critical_swap_lock():
                 retries = 5
                 while retries > 0:

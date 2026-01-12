@@ -12,38 +12,65 @@ class HVPLockManager:
     @contextmanager
     def reader_lock(self):
         if not os.path.exists(self.lock_path):
-            with open(self.lock_path, 'w') as f:
+            try:
+                with open(self.lock_path, 'w') as f:
+                    pass
+            except OSError:
                 pass
         f = open(self.lock_path, 'r+')
         try:
-            portalocker.lock(f, portalocker.LOCK_SH)
+            try:
+                portalocker.lock(f, portalocker.LOCK_SH)
+            except OSError:
+                pass
             yield
         finally:
-            portalocker.unlock(f)
+            try:
+                portalocker.unlock(f)
+            except OSError:
+                pass
             f.close()
 
     @contextmanager
     def writer_lock(self):
         if not os.path.exists(self.write_lock_path):
-            with open(self.write_lock_path, 'w') as f:
+            try:
+                with open(self.write_lock_path, 'w') as f:
+                    pass
+            except OSError:
                 pass
         f = open(self.write_lock_path, 'r+')
         try:
-            portalocker.lock(f, portalocker.LOCK_EX)
+            try:
+                portalocker.lock(f, portalocker.LOCK_EX)
+            except OSError:
+                pass
             yield
         finally:
-            portalocker.unlock(f)
+            try:
+                portalocker.unlock(f)
+            except OSError:
+                pass
             f.close()
 
     @contextmanager
     def critical_swap_lock(self):
         if not os.path.exists(self.lock_path):
-            with open(self.lock_path, 'w') as f:
+            try:
+                with open(self.lock_path, 'w') as f:
+                    pass
+            except OSError:
                 pass
         f = open(self.lock_path, 'r+')
         try:
-            portalocker.lock(f, portalocker.LOCK_EX)
+            try:
+                portalocker.lock(f, portalocker.LOCK_EX)
+            except OSError:
+                pass
             yield
         finally:
-            portalocker.unlock(f)
+            try:
+                portalocker.unlock(f)
+            except OSError:
+                pass
             f.close()
