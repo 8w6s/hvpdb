@@ -3,6 +3,9 @@ import sys
 from typing import Optional
 from .core import HVPDB
 
+def is_termux() -> bool:
+    return 'com.termux' in os.environ.get('PREFIX', '') or os.environ.get('TERMUX_VERSION') is not None
+
 def redact_target(target: str) -> str:
     if not target:
         return ''
