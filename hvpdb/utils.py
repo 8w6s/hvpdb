@@ -1,7 +1,6 @@
 import os
 import sys
 from typing import Optional
-from .core import HVPDB
 
 def is_termux() -> bool:
     return 'com.termux' in os.environ.get('PREFIX', '') or os.environ.get('TERMUX_VERSION') is not None
@@ -32,7 +31,8 @@ def normalize_target(target: str) -> str:
 def get_db_password() -> Optional[str]:
     return os.environ.get('HVPDB_PASSWORD')
 
-def connect_db(target: str, password: str=None) -> HVPDB:
+def connect_db(target: str, password: str=None):
+    from .core import HVPDB
     target = normalize_target(target)
     if password is None:
         password = get_db_password()
