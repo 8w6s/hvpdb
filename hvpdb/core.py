@@ -7,13 +7,19 @@ from typing import Dict, Any, List, Optional, Union
 import hashlib
 import secrets
 import difflib
+try:
+    from pydantic import BaseModel, ValidationError
+except ImportError:
+    BaseModel = None
+    ValidationError = None
 
 class HVPGroup:
 
-    def __init__(self, storage: HVPStorage, name: str, db_instance=None):
+    def __init__(self, storage: HVPStorage, name: str, db_instance=None, schema=None):
         self.storage = storage
         self.name = name
         self.db = db_instance
+        self.schema = schema
         self.indexes = {}
         self.unique_indexes = {}
         if name not in self.storage.data['groups']:
@@ -174,6 +180,15 @@ class HVPGroup:
         self.storage._dirty = True
 
     def insert(self, data: dict) -> dict:
+        if self.schema and BaseModel:
+            try:
+                # Validate against Pydantic schema
+                if isinstance(data, dict):
+                    model = self.schema(**data)
+                    data = model.model_dump()
+            except ValidationError as e:
+                raise ValueError(f"Schema Validation Error: {e}")
+
         if '_id' not in data:
             data['_id'] = str(uuid.uuid4())
         data['_created_at'] = time.time()
@@ -200,6 +215,13 @@ class HVPGroup:
     def _update_mem(self, doc_id: str, update_data: dict, old_doc: dict):
         new_state = old_doc.copy()
         new_state.update(update_data)
+
+        if self.schema and BaseModel:
+            try:
+                self.schema(**new_state)
+            except ValidationError as e:
+                raise ValueError(f"Schema Validation Error on Update: {e}")
+
         self._update_index(doc_id, old_doc, new_state)
         doc = self.storage.data['groups'][self.name][doc_id]
         doc.update(update_data)
@@ -368,9 +390,6 @@ class HVPDB:
             self.storage._dirty = True
 
     def hash_user_password(self, password: str) -> str:
-        return self._hash_password(password)
-
-    def _hash_password(self, password: str) -> str:
         try:
             from argon2 import PasswordHasher
             ph = PasswordHasher()
@@ -420,23 +439,26 @@ class HVPDB:
             return True
         return group_name in user['groups'] or '*' in user['groups']
 
-    def group(self, name: str) -> HVPGroup:
+    def group(self, name: str, schema=None) -> HVPGroup:
         if not name or any((c in name for c in '\\/:*?"<>|')):
             raise ValueError(f"Invalid group: '{name}'")
         if name in self._groups:
-            return self._groups[name]
+            grp = self._groups[name]
+            if schema:
+                grp.schema = schema
+            return grp
         if self.is_cluster:
             path = os.path.join(self.filepath, f'{name}.hvp')
             s = HVPStorage(path, self.password, durable=self.durable)
             s.load()
             if 'groups' not in s.data:
                 s.data['groups'] = {}
-            g = HVPGroup(s, name, self)
+            g = HVPGroup(s, name, self, schema=schema)
             self._groups[name] = g
             return g
         else:
             if name not in self._groups:
-                self._groups[name] = HVPGroup(self.storage, name, self)
+                self._groups[name] = HVPGroup(self.storage, name, self, schema=schema)
             return self._groups[name]
 
     def get_all_groups(self) -> List[str]:
