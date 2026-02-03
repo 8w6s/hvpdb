@@ -1,13 +1,62 @@
-name: Publish Python 🐍 distribution to PyPI
+name: CI + Publish Python distribution
 
 on:
+  push:
+  pull_request:
   release:
     types: [published]
   workflow_dispatch:
 
 jobs:
+  test:
+    name: Test (smoke + build)
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install -e .
+          python -m pip install build pytest ruff
+
+      - name: Compile
+        run: python -m compileall -q hvpdb
+
+      - name: Smoke import
+        run: python -c "import hvpdb; import hvpdb.cli; import hvpdb.hvpshell; print('smoke_ok')"
+
+      - name: Lint
+        run: ruff check --select E,F,I --ignore E501 hvpdb tests
+
+      - name: Typecheck
+        run: |
+          python -m pip install pyright
+          pyright
+
+      - name: Test
+        run: pytest -q
+
+      - name: Build sdist/wheel
+        run: python -m build
+
   build:
-    name: Build distribution 📦
+    name: Build distribution 
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
@@ -22,7 +71,6 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      # ❗ FIX CHÍNH Ở ĐÂY: KHÔNG dùng --user
       - name: Install build backend
         run: python -m pip install build
 
@@ -36,7 +84,7 @@ jobs:
           path: dist/
 
   publish-to-pypi:
-    name: Publish Python 🐍 distribution to PyPI
+    name: Publish Python distribution to PyPI
     if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
@@ -46,7 +94,7 @@ jobs:
       url: https://pypi.org/p/hvpdb
 
     permissions:
-      id-token: write   # REQUIRED for Trusted Publishing
+      id-token: write
 
     steps:
       - name: Download artifacts

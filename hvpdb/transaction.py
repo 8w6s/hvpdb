@@ -1,13 +1,20 @@
-import uuid
 import time
+import uuid
+
 
 class HVPTransactionGroup:
+    """
+    Transactional proxy for HVPGroup.
+    
+    Buffers operations during a transaction to ensure atomicity.
+    """
 
     def __init__(self, tx, real_group):
         self.tx = tx
         self.real_group = real_group
 
     def insert(self, data: dict):
+        """Buffer an insert operation."""
         if '_id' not in data:
             data['_id'] = str(uuid.uuid4())
         data['_created_at'] = time.time()
@@ -15,6 +22,7 @@ class HVPTransactionGroup:
         return data
 
     def update(self, query: dict, update_data: dict) -> int:
+        """Buffer an update operation."""
         docs = self.real_group.find(query)
         count = 0
         for doc in docs:
@@ -26,6 +34,7 @@ class HVPTransactionGroup:
         return count
 
     def delete(self, query: dict) -> int:
+        """Buffer a delete operation."""
         docs = self.real_group.find(query)
         count = 0
         for doc in docs:
@@ -34,12 +43,20 @@ class HVPTransactionGroup:
         return count
 
     def find(self, query: dict=None):
+        """Delegate find to the real group."""
         return self.real_group.find(query)
 
     def find_one(self, query: dict):
+        """Delegate find_one to the real group."""
         return self.real_group.find_one(query)
 
 class HVPTransaction:
+    """
+    Transaction context manager for HVPDB.
+    
+    Ensures ACID properties by buffering operations and committing them
+    atomically to both the WAL and memory.
+    """
 
     def __init__(self, db):
         self.db = db
@@ -49,6 +66,8 @@ class HVPTransaction:
         self._token = None
 
     def __enter__(self):
+        if getattr(self.db, 'is_cluster', False):
+            raise RuntimeError('Transactions not supported in cluster mode.')
         self._txn_id = self.db.storage.begin_txn()
         self._token = self.db._txn_ctx.set(self._txn_id)
         return self

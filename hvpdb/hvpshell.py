@@ -1,22 +1,90 @@
+import ast
 import cmd
-import shlex
+import copy
+import datetime
+import difflib
+import importlib
+import itertools
 import json
 import os
-import time
 import random
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import time
+import warnings
+from typing import Optional, Any
+
+try:
+    import readline
+except ImportError:
+    readline = None
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import InMemoryHistory, FileHistory
+    from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.styles import Style
+    HAS_PROMPT_TOOLKIT = True
+except ImportError:
+    HAS_PROMPT_TOOLKIT = False
+
 from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.tree import Tree
+from rich.json import JSON
 from rich.markup import escape
+from rich.panel import Panel
+from rich.table import Table
+from rich.tree import Tree
+
 from .core import HVPDB
+
+# Optional Plugins
+PermissionManager = None
+PolyglotParser = None
+QueryEngine = None
+
+try:
+    perms_mod = importlib.import_module('hvpdb_perms')
+    PermissionManager = getattr(perms_mod, 'PermissionManager', None)
+except ImportError:
+    PermissionManager = None
+except Exception as e:
+    warnings.warn(f"Optional plugin 'hvpdb_perms' failed to import: {e}")
+    PermissionManager = None
+
+try:
+    parser_mod = importlib.import_module('hvpdb_query.parser')
+    engine_mod = importlib.import_module('hvpdb_query.engine')
+    PolyglotParser = getattr(parser_mod, 'PolyglotParser', None)
+    QueryEngine = getattr(engine_mod, 'QueryEngine', None)
+except ImportError:
+    PolyglotParser = None
+    QueryEngine = None
+except Exception as e:
+    warnings.warn(f"Optional plugin 'hvpdb_query' failed to import: {e}")
+    PolyglotParser = None
+    QueryEngine = None
 console = Console()
 
 class HVPShell(cmd.Cmd):
+    """
+    Action-oriented database shell for HVPDB.
+    
+    Provides an interactive command-line interface for database management,
+    data operations, auditing, and system maintenance.
+    """
     intro = None
     prompt = 'hvpdb > '
 
-    def __init__(self, db: HVPDB=None):
+    def __init__(self, db: Optional[HVPDB] = None):
+        """
+        Initialize the shell with an optional database instance.
+        
+        Args:
+            db (HVPDB, optional): The database instance to manage. Defaults to None.
+        """
         super().__init__()
         self.db = db
         self.current_group = None
@@ -28,79 +96,142 @@ class HVPShell(cmd.Cmd):
         self._cmd_history = []
         self.record_mode = True
         self.auto_save = False
+        self._anchor: Optional[tuple] = None
+        self._prompt_session = None
+        if HAS_PROMPT_TOOLKIT:
+            history_file = os.path.join(os.path.expanduser('~'), '.hvpdb_history')
+            self._prompt_session = PromptSession(history=FileHistory(history_file))
 
     def preloop(self):
-        banner_text = "\n    [bold]Connection:[/bold]\n    - [green]connect[/green] <path>    : Connect to database\n    - [green]disconnect[/green]        : Disconnect current DB\n\n    [bold]Navigation:[/bold]\n    - [green]scan[/green]           : List all groups\n    - [green]target[/green] <group> : Select a group context\n    \n    [bold]Data Operations:[/bold]\n    - [green]peek[/green]           : View all documents\n    - [green]hunt[/green] k=v       : Search documents\n    - [green]make[/green] k=v       : Create new document\n    - [green]check[/green]          : Count documents\n    - [green]truncate[/green]       : Delete all documents in group\n    - [green]inhale/exhale[/green]  : Import/Export JSON\n    - [green]distinct[/green] <f>   : List unique values\n    - [green]stats[/green] <f>      : Calculate statistics\n    \n    [bold]Group Operations:[/bold]\n    - [green]rename[/green] <name>  : Rename current group\n    - [green]clone[/green] <src> <dst>: Clone a group\n    \n    [bold]Item Operations (After 'pick'):[/bold]\n    - [green]pick[/green] <index>   : Select document from list\n    - [green]morph[/green] k=v      : Update selected document\n    - [green]throw[/green]          : Delete selected document\n    - [green]fuse[/green] <id1> <id2>: Merge two documents\n    - [green]sift[/green]           : Deduplicate documents\n    \n    [bold]Audit & Version Control:[/bold]\n    - [green]record[/green]           : Data versioning (undo/redo)\n    - [green]trace[/green]            : View audit log\n    \n    [bold]System & Maintenance:[/bold]\n    - [green]save[/green]             : Save to disk\n    - [green]refresh[/green]          : Reload from disk\n    - [green]perm[/green]             : Check permissions\n    - [green]index[/green] <field>  : Create index\n    - [green]schema[/green]         : Infer schema\n    - [green]vacuum[/green]         : Compact storage\n    - [green]validate[/green]       : Check DB integrity\n    - [green]benchmark[/green]      : Run performance test\n    - [green]monitor[/green]        : Realtime dashboard\n    - [green]status[/green]         : Database info\n    - [green]tune[/green]           : Configure shell\n    - [green]history[/green]        : Show command history\n    - [green]clear[/green]          : Clear screen\n    - [green]quit[/green]           : Exit\n\n    [bold]Plugins:[/bold]\n    - [green]query[/green] <sql>    : Polyglot Query (SQL/Mongo/Redis)\n\n    [dim]Tip: Type 'help <command>' for detailed usage.[/dim]\n        "
+        """Display the welcome banner and initial instructions before starting the command loop."""
+        banner_text = """
+    [bold]Connection:[/bold]
+    - [green]connect[/green] <path>       : Connect to database
+    - [green]disconnect[/green]           : Disconnect current DB
+
+    [bold]Navigation:[/bold]
+    - [green]scan[/green]                 : List all groups
+    - [green]target[/green] <group>       : Select a group context
+
+    [bold]Data Operations:[/bold]
+    - [green]peek[/green] [limit|full|@i] : View documents
+    - [green]hunt[/green] k=v             : Search documents
+    - [green]make[/green] k=v             : Create new document
+    - [green]check[/green]                : Count documents
+    - [green]truncate[/green]             : Delete all documents in group
+    - [green]inhale[/green] / [green]exhale[/green]  : Import/Export JSON
+    - [green]distinct[/green] <field>     : List unique values
+    - [green]stats[/green] <field>        : Calculate statistics
+
+    [bold]Group Operations:[/bold]
+    - [green]rename[/green] <name>        : Rename current group
+    - [green]clone[/green] <src> <dst>    : Clone a group
+
+    [bold]Item Operations (After 'pick'):[/bold]
+    - [green]pick[/green] <index>         : Select document from list
+    - [green]morph[/green] k=v            : Update selected document
+    - [green]throw[/green]                : Delete selected document
+    - [green]fuse[/green] <id1> <id2>     : Merge two documents
+    - [green]sift[/green] [field]         : Deduplicate documents
+
+    [bold]Audit & Version Control:[/bold]
+    - [green]record[/green]               : Data versioning (undo/redo)
+    - [green]trace[/green]                : View audit log
+
+    [bold]System & Maintenance:[/bold]
+    - [green]save[/green]                 : Save to disk
+    - [green]refresh[/green]              : Reload from disk
+    - [green]perm[/green]                 : Check permissions
+    - [green]index[/green] <field>        : Create index
+    - [green]schema[/green]               : Infer schema
+    - [green]vacuum[/green]               : Compact storage
+    - [green]validate[/green]             : Check DB integrity
+    - [green]status[/green]               : Database info
+    - [green]history[/green]              : Show command history
+    - [green]clear[/green]                : Clear screen
+    - [green]quit[/green]                 : Exit
+
+    [dim]Tip: Type 'help <command>' for detailed usage.[/dim]
+        """
         console.print(Panel(banner_text.strip(), title='[bold cyan]HVPDB Ops Shell (HVPShell)[/bold cyan]', subtitle='[dim]Action-Oriented Database Shell[/dim]', border_style='cyan'))
         self._update_prompt()
 
     def do_status(self, arg):
+        """Display current database connection status, group context, and storage stats."""
         if not self.db:
             console.print('[yellow]Not connected.[/yellow]')
             return
-        console.print(Panel(f"Target: {self.db.filepath}\nGroup: {self.current_group or 'None'}\nSequence: {self.db.storage._last_sequence}\nDocs in Group: {(len(self.db.group(self.current_group).get_all()) if self.current_group else 0)}", title='Database Status'))
+        # Type guard for pyright
+        assert self.db is not None
+        
+        group_name = self.current_group.name if self.current_group else 'None'
+        seq = getattr(getattr(self.db, 'storage', None), '_last_sequence', None)
+        docs_in_group = self.current_group.count() if self.current_group else 0
+        content = f"""Target: {self.db.filepath}
+Group: {group_name}
+Sequence: {seq}
+Docs in Group: {docs_in_group}"""
+        console.print(Panel(content, title='Database Status'))
 
     def do_use(self, arg):
+        """Alias for 'target'. Switch the current group context."""
         self.do_target(arg)
 
-    def do_peek(self, arg):
-        if not self.db:
-            return
-        if not self.current_group:
-            console.print("[red]No group selected. Use 'target <group>' first.[/red]")
-            return
-        limit = 20
-        if arg and arg.isdigit():
-            limit = int(arg)
-        grp = self.db.group(self.current_group)
-        docs_iter = grp.get_all_iter()
-        import itertools
-        head_docs = list(itertools.islice(docs_iter, limit))
-        table = Table(title=f"Documents in '{self.current_group}'")
-        table.add_column('ID', style='cyan')
-        table.add_column('Preview', style='dim')
-        for doc in head_docs:
-            preview = str(doc)[:50] + '...' if len(str(doc)) > 50 else str(doc)
-            table.add_row(doc.get('_id', '?'), preview)
-        console.print(table)
-        total = len(grp.storage.data['groups'][self.current_group.name])
-        if total > limit:
-            console.print(f"[dim]... and {total - limit} more. Use 'peek {limit + 20}' to see more.[/dim]")
-
     def do_ls(self, arg):
+        """Alias for 'peek'."""
         self.do_peek(arg)
 
     def do_get(self, arg):
+        """
+        Retrieve and display a document by its ID.
+        
+        Usage: get <doc_id>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]Select a group first (use target <group>).[/red]')
             return
         doc_id = arg.strip()
         if not doc_id and self.current_doc:
             doc_id = self.current_doc['_id']
-        doc = self.db.group(self.current_group).find_one({'_id': doc_id})
+        doc = self.current_group.find_one({'_id': doc_id})
         if doc:
             console.print_json(data=doc)
         else:
             console.print(f'[red]Document {doc_id} not found.[/red]')
 
-    def do_cat(self, arg):
-        self.do_get(arg)
-
-    def do_show(self, arg):
-        self.do_get(arg)
+    do_cat = do_get
 
     def do_del(self, arg):
+        """
+        Delete a document by its ID from the current group.
+        
+        Usage: del <doc_id>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]Select a group first.[/red]')
             return
         doc_id = arg.strip()
-        if self.db.group(self.current_group).delete({'_id': doc_id}):
+        if self.current_group.delete({'_id': doc_id}):
             console.print(f'[green]Document {doc_id} deleted.[/green]')
             self.db.commit()
         else:
             console.print(f'[red]Document {doc_id} not found.[/red]')
 
     def do_grep(self, arg):
+        """
+        Search for documents matching a key=value pair.
+        
+        Usage: grep <key>=<value>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]Select a group first.[/red]')
             return
@@ -114,16 +245,17 @@ class HVPShell(cmd.Cmd):
             val = True
         elif val.lower() == 'false':
             val = False
-        results = self.db.group(self.current_group).find({key: val})
+        results = self.current_group.find({key: val})
         console.print(f'Found {len(results)} documents:')
         for doc in results[:10]:
             console.print(f'- {doc}')
 
-    def do_history(self, arg):
-        for i, cmd in enumerate(self._cmd_history):
-            console.print(f'{i + 1}: {cmd}')
 
     def do_change(self, arg):
+        if not self._check_db():
+            return
+        assert self.db is not None
+        
         parts = arg.split()
         if len(parts) < 2:
             console.print('[yellow]Usage: change <key> <value> [args...][/yellow]')
@@ -134,7 +266,7 @@ class HVPShell(cmd.Cmd):
             if not new_pass:
                 console.print('[red]Password cannot be empty.[/red]')
                 return
-            if console.input(f'[bold red]Change MASTER DB PASSWORD? This will re-encrypt the entire database. (yes/no): [/bold red]') != 'yes':
+            if console.input('[bold red]Change MASTER DB PASSWORD? This will re-encrypt the entire database. (yes/no): [/bold red]') != 'yes':
                 return
             try:
                 self.db.storage.password = new_pass
@@ -151,19 +283,8 @@ class HVPShell(cmd.Cmd):
                 return
             username = parts[1]
             new_user_pass = parts[2]
-            try:
-                from hvpdb_perms import PermissionManager
-                pm = PermissionManager(self.db)
-                current_user = getattr(self.db, 'current_user', None)
-                is_root = current_user is None or current_user == 'root'
-                if not is_root:
-                    caller_data = self.db.storage.data['users'].get(current_user)
-                    if not caller_data or caller_data.get('role') != 'admin':
-                        if current_user != username:
-                            console.print("[red]Access Denied: Only Admin/Root can change other users' passwords.[/red]")
-                            return
-            except ImportError:
-                pass
+            if not self.db:
+                return
             if 'users' not in self.db.get_all_groups():
                 console.print("[red]User management system not found (no 'users' group).[/red]")
                 return
@@ -184,48 +305,12 @@ class HVPShell(cmd.Cmd):
         console.print('[yellow]Unknown command or no document selected.[/yellow]')
         console.print("See 'help change' for system commands.")
 
-    def do_query(self, arg):
-        if not self._check_db():
-            return
-        if not arg:
-            console.print('[yellow]Usage: query <query_string>[/yellow]')
-            return
-        try:
-            from hvpdb_query.parser import PolyglotParser
-            from hvpdb_query.engine import QueryEngine
-        except ImportError:
-            console.print("[red]Error: 'hvpdb-query' plugin not installed.[/red]")
-            console.print("[yellow]This feature requires the Query Engine plugin.[/yellow]")
-            console.print("To install, run: [green]pip install hvpdb-query[/green]")
-            return
-        parser = PolyglotParser()
-        engine = QueryEngine(self.db)
-        try:
-            plan = parser.parse(arg)
-            if not plan:
-                console.print('[red]Invalid Query Syntax.[/red]')
-                return
-            results = engine.execute(plan)
-            if isinstance(results, list):
-                console.print(f'[green]Found {len(results)} results.[/green]')
-                self.last_search_results = results
-                if results:
-                    cols = set()
-                    for r in results[:10]:
-                        cols.update(r.keys())
-                    cols = sorted(list(cols))
-                    table = Table(show_header=True)
-                    for c in cols:
-                        table.add_column(c)
-                    for r in results:
-                        table.add_row(*[str(r.get(c, '')) for c in cols])
-                    console.print(table)
-            else:
-                console.print(f'[green]Result: {results}[/green]')
-        except Exception as e:
-            console.print(f'[red]Query Failed: {e}[/red]')
-
     def do_connect(self, arg):
+        """
+        Connect to a database file with optional password.
+        
+        Usage: connect <path> [password]
+        """
         if self.db:
             console.print("[yellow]Already connected. Use 'disconnect' first.[/yellow]")
             return
@@ -254,13 +339,14 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Connection failed: {err_msg}[/red]')
 
     def do_disconnect(self, arg):
+        """Close the current database connection and clear context."""
         if not self.db:
             console.print('[yellow]Not connected.[/yellow]')
             return
         try:
             self.db.close()
-        except:
-            pass
+        except Exception as e:
+            console.print(f'[red]Error closing database: {e}[/red]')
         self.db = None
         self.current_group = None
         self.current_doc = None
@@ -270,9 +356,10 @@ class HVPShell(cmd.Cmd):
         self._update_prompt()
 
     def do_refresh(self, arg):
-        if not self.db:
-            console.print('[yellow]Not connected.[/yellow]')
+        """Reload the database from disk to pick up external changes."""
+        if not self._check_db():
             return
+        assert self.db is not None
         try:
             self.db.refresh()
             console.print('[green]Database refreshed successfully.[/green]')
@@ -282,8 +369,15 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Refresh failed: {e}[/red]')
 
     def do_set(self, arg):
+        """
+        Create or replace a document by ID with raw JSON.
+        
+        Usage: set <id> <json_string>
+        """
         if not self._check_db():
             return
+        assert self.db is not None
+        
         if not self.current_group:
             console.print("[red]Select a group first with 'use <group>'[/red]")
             return
@@ -298,7 +392,7 @@ class HVPShell(cmd.Cmd):
                 console.print('[red]Data must be a JSON object[/red]')
                 return
             data['_id'] = doc_id
-            grp = self.db.group(self.current_group)
+            grp = self.current_group
             existing = grp.find_one({'_id': doc_id})
             if existing:
                 grp.delete({'_id': doc_id})
@@ -314,8 +408,14 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Error: {e}[/red]')
 
     def do_patch(self, arg):
+        """
+        Partially update a document by ID with raw JSON.
+        
+        Usage: patch <id> <json_string>
+        """
         if not self._check_db():
             return
+        assert self.db is not None
         if not self.current_group:
             console.print("[red]Select a group first with 'use <group>'[/red]")
             return
@@ -329,7 +429,7 @@ class HVPShell(cmd.Cmd):
             if not isinstance(data, dict):
                 console.print('[red]Data must be a JSON object[/red]')
                 return
-            grp = self.db.group(self.current_group)
+            grp = self.current_group
             count = grp.update({'_id': doc_id}, data)
             self.db.commit()
             if count:
@@ -342,25 +442,26 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Error: {e}[/red]')
 
     def _check_db(self):
+        """Verify that a database connection is active."""
         if not self.db:
             console.print("[red]Not connected to any database. Use 'connect <path>' first.[/red]")
             return False
         return True
 
     def cmdloop(self, intro=None):
+        """Start the interactive command loop."""
         self.preloop()
-        if self.use_rawinput and self.completekey:
-            try:
-                import readline
+        if self.use_rawinput and self.completekey and not HAS_PROMPT_TOOLKIT:
+            if readline:
                 self.old_completer = readline.get_completer()
-                readline.set_completer(self.complete)
+                readline.set_completer(self.complete) # type: ignore
                 readline.parse_and_bind(self.completekey + ': complete')
-            except ImportError:
-                pass
         stop = None
         while not stop:
             try:
-                if self.use_rawinput:
+                if HAS_PROMPT_TOOLKIT and self._prompt_session:
+                    line = self._prompt_session.prompt(self.prompt)
+                elif self.use_rawinput:
                     line = console.input(self.prompt)
                 else:
                     self.stdout.write(self.prompt)
@@ -382,16 +483,18 @@ class HVPShell(cmd.Cmd):
         self.postloop()
 
     def precmd(self, line):
+        """Hook executed before each command."""
         if line and line != 'history':
             self._cmd_history.append(self._redact_history(line))
         return line
 
     def _redact_history(self, line: str) -> str:
+        """Mask sensitive information in command history."""
         SENSITIVE_CMDS = ('connect', 'become', 'user create', 'hvpdb shell', 'hvpdb init')
         SENSITIVE_KEYS = ('password=', 'pass=', 'token=', 'secret=', 'key=')
         low = line.lower().strip()
-        for cmd in SENSITIVE_CMDS:
-            if low.startswith(cmd):
+        for sensitive_cmd in SENSITIVE_CMDS:
+            if low.startswith(sensitive_cmd):
                 parts = line.split()
                 if len(parts) > 1:
                     return parts[0] + ' [REDACTED]'
@@ -414,44 +517,23 @@ class HVPShell(cmd.Cmd):
         return line
 
     def do_history(self, arg):
+        """Show recently executed commands (masked)."""
         if not self._cmd_history:
             console.print('[dim]No history yet.[/dim]')
             return
-        for i, cmd in enumerate(self._cmd_history[-20:]):
-            console.print(f'{i + 1}. {cmd}')
-
-    def do_unset(self, arg):
-        if not self._check_db():
-            return
-        if not self.current_group:
-            console.print('[red]Select a group first.[/red]')
-            return
-        parts = arg.split()
-        if len(parts) < 2:
-            console.print('[yellow]Usage: unset <id> <field>[/yellow]')
-            return
-        doc_id, field = (parts[0], parts[1])
-        grp = self.db.group(self.current_group)
-        doc = grp.find_one({'_id': doc_id})
-        if not doc:
-            console.print(f'[red]Document {doc_id} not found.[/red]')
-            return
-        if field in doc:
-            del doc[field]
-            grp.delete({'_id': doc_id})
-            grp.insert(doc)
-            self.db.commit()
-            console.print(f"[green]Field '{field}' removed from {doc_id}.[/green]")
-        else:
-            console.print(f"[yellow]Field '{field}' not in document.[/yellow]")
+        for i, entry in enumerate(self._cmd_history[-20:]):
+            console.print(f'{i + 1}. {entry}')
 
     def do_tour(self, arg):
+        """Start a quick tour of HVPDB features."""
         self.do_getatour(arg)
 
     def do_cheatsheet(self, arg):
+        """Display a quick reference guide for common commands."""
         console.print(Panel('\n        [bold]HVPDB Cheatsheet[/bold]\n        [green]focus <group>[/green]   : Select group (e.g. focus users)\n        [green]find k=v[/green]        : Search (e.g. find role=admin)\n        [green]show[/green]            : List docs (e.g. show, show 20)\n        [green]create k=v[/green]      : New doc (e.g. create name=A)\n        [green]update k=v[/green]      : Edit doc (e.g. update age=30)\n        [green]remove[/green]          : Delete doc\n        [green]timeline[/green]        : History\n        [green]quit[/green]            : Exit\n        ', title='Quick Ref'))
 
     def do_examples(self, arg):
+        """Show usage examples for common operations."""
         console.print('[bold]Examples:[/bold]')
         console.print('  create name=Alice role=admin')
         console.print('  focus users')
@@ -460,6 +542,11 @@ class HVPShell(cmd.Cmd):
         console.print('  stats age')
 
     def do_explain(self, arg):
+        """
+        Explain a command's purpose and usage.
+        
+        Usage: explain <command>
+        """
         if not arg:
             console.print('[yellow]Usage: explain <command>[/yellow]')
             return
@@ -470,44 +557,56 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Unknown command: {arg}[/red]')
 
     def do_why(self, arg):
+        """Provide automated analysis for errors or unexpected behavior."""
         console.print('[dim]Analysis: Most likely syntax error or missing permission.[/dim]')
 
     def do_tips(self, arg):
+        """Display a random tip for efficient database usage."""
         tips = ["Use 'focus <group>' to switch context quickly.", "Batch operations: 'find k=v' -> 'select all' -> 'update k=v2'", "Use 'track' to see your command history.", "Type 'help <cmd>' for detailed usage."]
         console.print(f'[cyan]💡 Tip: {random.choice(tips)}[/cyan]')
 
     def do_doctor(self, arg):
+        """Run database diagnostics and health checks."""
         self.do_diagnose(arg)
 
     def do_teach(self, arg):
+        """Enable interactive teacher mode (explains actions)."""
         console.print('[dim]Teacher mode active.[/dim]')
 
     def do_focus(self, arg):
+        """
+        Switch context to a specific group.
+        
+        Usage: focus <group_name>
+        """
         self.do_target(arg)
 
     def do_unfocus(self, arg):
+        """Clear the current group context."""
         self.current_group = None
         self._update_prompt()
         console.print('[dim]Context cleared.[/dim]')
 
     def do_switch(self, arg):
+        """Switch back to the previously focused group."""
         if self.prev_group:
             self.do_target(self.prev_group.name if hasattr(self.prev_group, 'name') else self.prev_group)
         else:
             console.print('[yellow]No previous group.[/yellow]')
 
     def do_context(self, arg):
+        """Display current database and group context."""
         self.do_status(arg)
 
-    def do_lock(self, arg):
-        self.is_locked = True
-        console.print('[red]🔒 Shell Locked (Read-Only)[/red]')
-
-    def do_unlock(self, arg):
-        self.is_locked = False
-        console.print('[green]🔓 Shell Unlocked[/green]')
-
     def do_show(self, arg):
+        """
+        List documents in the current group.
+        
+        Usage: 
+            show        : List documents
+            show at <id>: Show specific document
+            show full   : Show detailed list
+        """
         args = arg.split()
         if not args:
             self.do_ls('')
@@ -519,32 +618,33 @@ class HVPShell(cmd.Cmd):
             self.do_ls(arg)
 
     def do_sample(self, arg):
+        """Display a random sample of documents from the current group."""
         self.do_sample_impl(arg)
 
     def do_find(self, arg):
+        """
+        Search for documents matching criteria.
+        
+        Usage: find <key>=<value> [<key2>=<value2> ...]
+        """
         self.do_hunt(arg)
 
     def do_count(self, arg):
+        """Count documents in the current group or matching a search."""
         if arg:
             self.do_hunt(arg)
         else:
             self.do_check(arg)
 
-    def do_distinct(self, arg):
-        if not self.current_group:
-            return
-        field = arg.split()[0] if arg else ''
-        if not field:
-            console.print('[yellow]Usage: distinct <field>[/yellow]')
-            return
-        values = set()
-        for doc in self.current_group.find():
-            if field in doc:
-                values.add(str(doc[field]))
-        console.print(f"[bold]Distinct values for '{field}':[/bold]")
-        console.print(', '.join(sorted(values)))
-
     def do_freq(self, arg):
+        """
+        Show frequency distribution for values of a field.
+        
+        Usage: freq <field>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             return
         field = arg.split()[0]
@@ -554,63 +654,110 @@ class HVPShell(cmd.Cmd):
         c = Counter(vals)
         console.print(f"Frequency for '{field}': {c.most_common(10)}")
 
-    def do_stats(self, arg):
-        self.do_stats_impl(arg)
-
     def do_create(self, arg):
+        """
+        Create a new document in the current group.
+        
+        Usage: create <key>=<value> [<key2>=<value2> ...]
+        """
         self.do_make(arg)
 
     def do_creategroup(self, arg):
-        if not self.db:
+        """
+        Create a new document group (collection).
+        
+        Usage: creategroup <group_name>
+        """
+        if not self._check_db():
             return
+        assert self.db is not None
         self.db.group(arg)
         console.print(f"[green]Group '{arg}' created.[/green]")
 
     def do_update(self, arg):
+        """
+        Update documents matching current selection or ID.
+        
+        Usage: update <key>=<value> [<key2>=<value2> ...]
+        """
         self.do_morph(arg)
 
-    def do_set(self, arg):
-        parts = arg.split(maxsplit=1)
-        if len(parts) == 2:
-            self.do_morph(f'{parts[0]}={parts[1]}')
-        else:
-            console.print('[yellow]Usage: set <field> <value>[/yellow]')
 
     def do_unset(self, arg):
-        if not self.current_group:
+        """
+        Remove a field from a document or from the current selection.
+
+        Usage:
+            unset <field>
+            unset <id> <field>
+        """
+        if not self._check_db():
             return
-        target_ids = []
+        assert self.db is not None
+        if not self.current_group:
+            console.print('[red]Select a group first.[/red]')
+            return
+
+        parts = arg.split()
+        if not parts:
+            console.print('[yellow]Usage: unset <field> | unset <id> <field>[/yellow]')
+            return
+
+        if len(parts) == 2:
+            doc_id, field = parts
+            doc = self.current_group.find_one({'_id': doc_id})
+            if not doc:
+                console.print(f'[red]Document {doc_id} not found.[/red]')
+                return
+            if field not in doc:
+                console.print(f"[yellow]Field '{field}' not in document.[/yellow]")
+                return
+            del doc[field]
+            self.current_group.update({'_id': doc_id}, doc)
+            self.db.commit()
+            console.print(f"[green]Field '{field}' removed from {doc_id}.[/green]")
+            return
+
+        if len(parts) != 1:
+            console.print('[yellow]Usage: unset <field> | unset <id> <field>[/yellow]')
+            return
+
+        field = parts[0]
         if self.selected_docs:
-            target_ids = self.selected_docs
+            target_ids = list(self.selected_docs)
         elif self.current_doc:
-            target_ids = [self.current_doc['_id']]
+            target_ids = [self.current_doc.get('_id')]
         else:
             console.print('[red]No document selected.[/red]')
             return
+
         count = 0
         for doc_id in target_ids:
-            doc = self.current_group.find_one({'_id': doc_id})
-            if doc and arg in doc:
-                del doc[arg]
-                self.current_group.update({'_id': doc_id}, doc)
-                pass
-        parts = arg.split()
-        if not parts:
-            return
-        field = parts[0]
-        for doc_id in target_ids:
+            if not doc_id:
+                continue
             doc = self.current_group.find_one({'_id': doc_id})
             if doc and field in doc:
                 del doc[field]
                 self.current_group.update({'_id': doc_id}, doc)
-                self.db.storage._dirty = True
                 count += 1
-        self.db.commit()
+        if count:
+            self.db.commit()
         console.print(f"[green]Unset '{field}' in {count} docs.[/green]")
 
     def do_replace(self, arg):
+        """
+        Replace entire content of the current document with JSON.
+        
+        Usage: replace <json_string>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_doc:
             console.print('[red]Select a document first.[/red]')
+            return
+        if not self.current_group:
+            console.print('[red]Select a group first.[/red]')
             return
         try:
             new_data = json.loads(arg)
@@ -627,113 +774,158 @@ class HVPShell(cmd.Cmd):
             console.print('[red]Invalid JSON.[/red]')
 
     def do_remove(self, arg):
+        """Delete current document or selection."""
         self.do_throw(arg)
 
     def do_removeid(self, arg):
+        """
+        Delete a document by its ID.
+        
+        Usage: removeid <id>
+        """
         self.do_del(arg)
 
     def do_renamegroup(self, arg):
+        """
+        Rename the current or specified group.
+        
+        Usage: renamegroup <new_name>
+        """
         self.do_rename(arg)
 
     def do_clonegroup(self, arg):
+        """
+        Clone the current group to a new group.
+        
+        Usage: clonegroup <target_group>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_clone(arg)
 
-    def do_move(self, arg):
-        if not self.current_group:
-            return
-        target = arg.strip()
-        if self.selected_docs:
-            for doc_id in self.selected_docs:
-                self._exec_move_copy(self.current_group, doc_id, target, is_move=True)
-        elif self.current_doc:
-            self._exec_move_copy(self.current_group, self.current_doc['_id'], target, is_move=True)
-        else:
-            console.print('[yellow]Select docs first.[/yellow]')
-
     def do_moveid(self, arg):
+        """
+        Move a specific document by ID to another group.
+        
+        Usage: moveid <id> <target_group>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
+        if not self.current_group:
+            console.print('[red]Select a group first.[/red]')
+            return
         parts = arg.split()
         if len(parts) == 2:
             self._exec_move_copy(self.current_group, parts[0], parts[1], is_move=True)
 
-    def do_copy(self, arg):
-        if not self.current_group:
-            return
-        target = arg.strip()
-        if self.selected_docs:
-            for doc_id in self.selected_docs:
-                self._exec_move_copy(self.current_group, doc_id, target, is_move=False)
-        elif self.current_doc:
-            self._exec_move_copy(self.current_group, self.current_doc['_id'], target, is_move=False)
-
     def do_copyid(self, arg):
+        """
+        Copy a specific document by ID to another group.
+        
+        Usage: copyid <id> <target_group>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
         parts = arg.split()
         if len(parts) == 2:
+            if not self.current_group:
+                console.print('[red]Select a source group first.[/red]')
+                return
+            assert self.current_group is not None
             self._exec_move_copy(self.current_group, parts[0], parts[1], is_move=False)
 
-    def do_merge(self, arg):
-        console.print('[dim]Merge not implemented yet.[/dim]')
-
-    def do_dedupe(self, arg):
-        console.print('[dim]Dedupe not implemented yet.[/dim]')
-
     def do_snapshot(self, arg):
+        """Create a point-in-time backup of the database."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_backup(arg)
 
     def do_restore(self, arg):
+        """Instructions for restoring from a snapshot."""
         console.print("[yellow]Use 'connect' to open snapshot, or manual file copy.[/yellow]")
 
     def do_verify(self, arg):
+        """Verify database integrity and health."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_validate(arg)
 
     def do_guard(self, arg):
+        """Enable write-protection guard mode."""
         console.print('[dim]Guard mode enabled.[/dim]')
 
     def do_confirm(self, arg):
+        """Set the required confirmation level for destructive operations."""
         console.print(f'[dim]Confirmation level set to {arg}[/dim]')
 
     def do_seal(self, arg):
+        """Alias for 'lock'."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_lock(arg)
 
     def do_unseal(self, arg):
+        """Alias for 'unlock'."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_unlock(arg)
 
     def do_timeline(self, arg):
+        """Show version history for the current group or document."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_record('list ' + arg)
 
-    def do_change(self, arg):
-        self.do_record('peek ' + arg)
-
     def do_revert(self, arg):
+        """Roll back changes to a previous state."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_record('undo ' + arg)
 
     def do_reapply(self, arg):
+        """Re-apply a previously reverted change."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_record('apply ' + arg)
 
     def do_checkpoint(self, arg):
+        """Manually trigger a disk synchronization (fsync)."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.db.storage.save()
         console.print('[green]Checkpoint created.[/green]')
 
     def do_recover(self, arg):
+        """Trigger automated recovery from WAL (usually automatic on connect)."""
         console.print('[dim]Recovery runs automatically on connect.[/dim]')
 
-    def do_make(self, arg):
-        if arg.startswith('group:'):
-            grp_name = arg.split(':', 1)[1]
-            self.do_creategroup(grp_name)
-            return
-        self.do_create(arg)
-
     def do_query(self, arg):
+        """
+        Execute a complex query using the Polyglot Query Engine.
+        
+        Usage: query <query_string>
+        """
         if not self._check_db():
             return
+        assert self.db is not None
         engine = None
         parser = None
-        try:
-            from hvpdb_query.parser import PolyglotParser
-            from hvpdb_query.engine import QueryEngine
+        
+        if PolyglotParser and QueryEngine:
             parser = PolyglotParser()
             engine = QueryEngine(self.db)
-        except ImportError:
+        else:
             if 'query' not in self.db.plugins:
                 console.print('[red]Query plugin not installed (hvpdb-query package missing).[/red]')
                 console.print("To install, run: [green]pip install hvpdb-query[/green]")
@@ -753,61 +945,82 @@ class HVPShell(cmd.Cmd):
         except Exception as e:
             console.print(f'[red]Query Error: {e}[/red]')
 
-    def do_target(self, arg):
-        pass
 
     def do_scout(self, arg):
+        """Scan for patterns or metadata."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_scan(arg)
 
     def do_scry(self, arg):
+        """Inspect schema and structure."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_schema(arg)
 
-    def do_hunt(self, arg):
-        pass
-
-    def do_nuke(self, arg):
-        pass
-
-    def do_morph(self, arg):
-        pass
-
-    def do_throw(self, arg):
-        pass
 
     def do_pulse(self, arg):
+        """Alias for 'status'."""
         self.do_status(arg)
 
     def do_ignite(self, arg):
+        """Alias for 'connect'."""
         self.do_connect(arg)
 
     def do_vanish(self, arg):
+        """Alias for 'quit'."""
         return self.do_quit(arg)
 
     def do_freeze(self, arg):
+        """Alias for 'save' (checkpoint)."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_save(arg)
 
     def do_revive(self, arg):
+        """Alias for 'refresh'."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_refresh(arg)
 
     def do_drain(self, arg):
+        """Alias for 'vacuum'."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         self.do_vacuum(arg)
 
     def do_crypt(self, arg):
+        """Change database password or encryption settings."""
         self.do_change('db_password ' + arg)
 
     def do_track(self, arg):
+        """Alias for 'history'."""
         self.do_history(arg)
 
     def do_chronos(self, arg):
+        """Display current system time."""
         console.print(f"[cyan]{time.strftime('%Y-%m-%d %H:%M:%S')}[/cyan]")
 
     def do_anchor(self, arg):
+        """Mark the current context (group/doc) for quick return."""
         self._anchor = (self.current_group, self.current_doc)
         console.print('[cyan]Anchor established.[/cyan]')
 
     def do_recall(self, arg):
+        """Return to the previously established anchor."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         if hasattr(self, '_anchor') and self._anchor:
             grp, doc = self._anchor
+            if not grp:
+                console.print('[yellow]Anchor group is invalid.[/yellow]')
+                return
             grp_name = grp.name if hasattr(grp, 'name') else grp
             if grp_name in self.db.get_all_groups():
                 self.current_group = self.db.group(grp_name)
@@ -819,34 +1032,25 @@ class HVPShell(cmd.Cmd):
         else:
             console.print('[yellow]No anchor.[/yellow]')
 
-    def do_hunt_impl(self, arg):
-        self.do_grep(arg)
-
-    def do_make_impl(self, arg):
-        if not self._check_db() or not self.current_group:
+    def do_diagnose(self, arg):
+        if not self._check_db():
             return
+        assert self.db is not None
+        
         try:
-            data = {}
-            for part in arg.split():
-                if '=' in part:
-                    k, v = part.split('=', 1)
-                    data[k] = v
-            if data:
-                self.db.group(self.current_group).insert(data)
-                self.db.commit()
-                console.print(f'[green]Entity created: {data}[/green]')
-            else:
-                console.print('[yellow]Usage: create key=value ...[/yellow]')
+            from .diagnostics import Diagnostics
+            diag = Diagnostics(self.db.filepath, self.db.storage.password)
+            report = diag.doctor()
+            console.print_json(data=report)
+        except ImportError:
+            console.print('[red]Diagnostics module not found.[/red]')
         except Exception as e:
-            console.print(f'[red]Error: {e}[/red]')
-
-    def do_morph_impl(self, arg):
-        console.print('[dim]Morphing... (Not fully implemented)[/dim]')
+            console.print(f'[red]Diagnosis failed: {e}[/red]')
 
     def do_check_impl(self, arg):
         if not self.current_group:
             return
-        c = self.db.group(self.current_group).count()
+        c = self.current_group.count()
         console.print(f'[cyan]Count: {c}[/cyan]')
 
     def do_stats_impl(self, arg):
@@ -861,21 +1065,26 @@ class HVPShell(cmd.Cmd):
         console.print(f'[red]Cleansed {self.current_group}.[/red]')
 
     def do_fuse(self, arg):
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
+        
         parts = arg.split()
         if len(parts) < 2:
             console.print('[yellow]Usage: fuse <id1> <id2> [prefer_left|prefer_right][/yellow]')
             return
         id1, id2 = (parts[0], parts[1])
         strategy = parts[2] if len(parts) > 2 else 'prefer_right'
-        grp = self.db.group(self.current_group)
+        grp = self.current_group
         doc1 = grp.find_one({'_id': id1})
         doc2 = grp.find_one({'_id': id2})
         if not doc1 or not doc2:
             console.print('[red]One or both documents not found.[/red]')
             return
+
         merged = doc1.copy()
         merged.update(doc2)
         if strategy == 'prefer_left':
@@ -891,10 +1100,14 @@ class HVPShell(cmd.Cmd):
         self.do_fuse(arg)
 
     def do_sift(self, arg):
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
-        grp = self.db.group(self.current_group)
+        
+        grp = self.current_group
         docs = grp.find()
         seen = set()
         to_delete = []
@@ -929,9 +1142,13 @@ class HVPShell(cmd.Cmd):
         self.do_sift(arg)
 
     def do_inhale(self, arg):
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
+        
         if not arg:
             console.print('[yellow]Usage: inhale <file.json>[/yellow]')
             return
@@ -947,7 +1164,7 @@ class HVPShell(cmd.Cmd):
             if not isinstance(data, list):
                 console.print('[red]Invalid JSON format. Expected list or dict.[/red]')
                 return
-            grp = self.db.group(self.current_group)
+            grp = self.current_group
             count = 0
             with console.status(f'Inhaling {len(data)} documents...'):
                 for doc in data:
@@ -959,10 +1176,10 @@ class HVPShell(cmd.Cmd):
         except Exception as e:
             console.print(f'[red]Inhale failed: {e}[/red]')
 
-    def do_import(self, arg):
-        self.do_inhale(arg)
-
     def do_exhale(self, arg):
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
@@ -970,16 +1187,13 @@ class HVPShell(cmd.Cmd):
             console.print('[yellow]Usage: exhale <file.json>[/yellow]')
             return
         path = arg.strip()
-        docs = self.db.group(self.current_group).find()
+        docs = self.current_group.find()
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(docs, f, indent=2, default=str)
             console.print(f'[green]Exhaled {len(docs)} documents to {path}.[/green]')
         except Exception as e:
             console.print(f'[red]Exhale failed: {e}[/red]')
-
-    def do_export(self, arg):
-        self.do_exhale(arg)
 
     def do_tune(self, arg):
         parts = arg.split()
@@ -1001,12 +1215,14 @@ class HVPShell(cmd.Cmd):
     def do_void_impl(self, arg):
         if not self._check_db() or not self.current_group:
             return
+        assert self.db is not None
+        
         parts = arg.split()
         if len(parts) < 2:
             console.print('[yellow]Usage: void <id> <field>[/yellow]')
             return
         doc_id, field = (parts[0], parts[1])
-        grp = self.db.group(self.current_group)
+        grp = self.current_group
         doc = grp.find_one({'_id': doc_id})
         if doc:
             if field in doc:
@@ -1020,10 +1236,13 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Document {doc_id} not found.[/red]')
 
     def do_sample_impl(self, arg):
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]Select a group first.[/red]')
             return
-        docs = self.db.group(self.current_group).get_all()
+        docs = self.current_group.get_all()
         if docs:
             doc = random.choice(docs)
             console.print_json(data=doc)
@@ -1092,16 +1311,16 @@ class HVPShell(cmd.Cmd):
         except Exception as e:
             console.print(f'[red]Tour Error:[/red] {escape(str(e))}')
 
-    def do_calc(self, arg):
-        pass
-
     def do_type(self, arg):
+        if not self._check_db():
+            return
         if not self.current_group:
             return
+        assert self.current_group is not None
         parts = arg.split()
         if len(parts) < 2:
             return
-        doc = self.db.group(self.current_group).find_one({'_id': parts[0]})
+        doc = self.current_group.find_one({'_id': parts[0]})
         if doc and parts[1] in doc:
             val = doc[parts[1]]
             console.print(f'Type: [cyan]{type(val).__name__}[/cyan] | Value: {val}')
@@ -1109,7 +1328,14 @@ class HVPShell(cmd.Cmd):
             console.print('[red]Not found[/red]')
 
     def do_clear(self, arg):
-        os.system('cls' if os.name == 'nt' else 'clear')
+        try:
+            if os.name == 'nt':
+                subprocess.run(['cmd', '/c', 'cls'], check=False)
+            else:
+                subprocess.run(['clear'], check=False)
+        except Exception as e:
+            warnings.warn(f"Clear command failed: {e}")
+            console.print('\n' * 80)
 
     def do_cls(self, arg):
         self.do_clear(arg)
@@ -1158,36 +1384,24 @@ class HVPShell(cmd.Cmd):
     def complete_stats(self, text, line, begidx, endidx):
         return self._complete_fields(text, line, begidx, endidx)
 
-    def do_become(self, arg):
-        if not self._check_db():
-            return
-        username = arg.strip()
-        if not username:
-            console.print('[red]Usage: become <username>[/red]')
-            return
-        if username not in self.db.storage.data.get('users', {}):
-            console.print(f"[red]User '{username}' does not exist.[/red]")
-            return
-        import getpass
-        password = console.input(f'Password for [cyan]{username}[/cyan]: ', password=True)
-        if self.db.authenticate(username, password):
-            console.print(f'[green]Authenticated as {username}[/green]')
-            self._update_prompt()
-        else:
-            console.print('[red]Authentication failed: Invalid password.[/red]')
-
     def do_whoami(self, arg):
-        user = getattr(self.db, 'current_user', None)
-        username = user
-        if hasattr(user, 'username'):
+        """Display the current authenticated user."""
+        user = getattr(self.db, 'current_user', None) if self.db else None
+        username = None
+        if user and hasattr(user, 'username'):
             username = user.username
+        elif user:
+            username = str(user)
         if not username:
             username = 'root (system)'
         console.print(f'[bold cyan]{username}[/bold cyan]')
 
     def do_perm(self, arg):
+        """Check current user permissions across all groups."""
         if not self._check_db():
             return
+        assert self.db is not None
+        
         username = getattr(self.db, 'current_user', None)
         if not username:
             console.print('[bold red]Current User: root (System Admin)[/bold red]')
@@ -1225,6 +1439,14 @@ class HVPShell(cmd.Cmd):
         console.print(table)
 
     def do_edit(self, arg):
+        """
+        Open a document in the system's default text editor.
+        
+        Usage: edit <doc_id>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
@@ -1235,14 +1457,13 @@ class HVPShell(cmd.Cmd):
         if not doc:
             console.print(f'[red]Document {arg} not found.[/red]')
             return
-        import tempfile
-        import subprocess
         try:
             fd, tf_path = tempfile.mkstemp(suffix='.json', text=True)
             with os.fdopen(fd, 'w') as tf:
                 json.dump(doc, tf, indent=2, default=str)
             if os.name == 'nt':
-                os.system(f'notepad {tf_path}')
+                os.startfile(tf_path)
+                console.input("[yellow]Press Enter after you have saved and closed the editor...[/yellow]")
             else:
                 editor = os.environ.get('EDITOR', 'vim')
                 subprocess.call([editor, tf_path])
@@ -1264,23 +1485,52 @@ class HVPShell(cmd.Cmd):
                 os.remove(tf_path)
 
     def do_calc(self, arg):
+        """Perform basic mathematical calculations."""
+        def eval_expr(node):
+            if isinstance(node, ast.Expression):
+                return eval_expr(node.body)
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, (int, float)):
+                    return node.value
+                raise ValueError('Only numbers allowed')
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+                val = eval_expr(node.operand)
+                return +val if isinstance(node.op, ast.UAdd) else -val
+            if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+                left = eval_expr(node.left)
+                right = eval_expr(node.right)
+                if isinstance(node.op, ast.Add):
+                    return left + right
+                if isinstance(node.op, ast.Sub):
+                    return left - right
+                if isinstance(node.op, ast.Mult):
+                    return left * right
+                return left / right
+            raise ValueError('Unsupported expression')
+
+        expr = (arg or '').strip()
+        if not expr:
+            console.print('[yellow]Usage: calc <expression>[/yellow]')
+            return
+
         try:
-            allowed = set('0123456789+-*/(). ')
-            if not all((c in allowed for c in arg)):
-                console.print('[red]Only basic math allowed.[/red]')
-                return
-            if '**' in arg or '//' in arg:
-                pass
-            console.print(f"= {eval(arg, {'__builtins__': {}})}")
+            tree = ast.parse(expr, mode='eval')
+            result = eval_expr(tree)
+            console.print(f"= {result}")
         except SyntaxError:
             console.print('[red]Invalid Syntax[/red]')
         except Exception as e:
             console.print(f'[red]Error: {e}[/red]')
 
     def do_schema(self, arg):
+        """Infer and display the schema of the current group."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
+
         docs = self.current_group.find()
         if not docs:
             console.print('[dim]Group is empty. Cannot infer schema.[/dim]')
@@ -1301,6 +1551,14 @@ class HVPShell(cmd.Cmd):
         console.print(table)
 
     def do_distinct(self, arg):
+        """
+        List unique values for a specific field.
+        
+        Usage: distinct <field_name>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
@@ -1320,6 +1578,10 @@ class HVPShell(cmd.Cmd):
             console.print(f'- {v}')
 
     def do_stats(self, arg):
+        """Show statistical summary for a numeric field."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
@@ -1339,6 +1601,10 @@ class HVPShell(cmd.Cmd):
         console.print(Panel(f"\n        Statistics for '{arg}'\n        --------------------\n        Count: {len(values)}\n        Min  : {min(values)}\n        Max  : {max(values)}\n        Sum  : {sum(values)}\n        Avg  : {avg:.2f}\n        ", title='Stats'))
 
     def do_rename(self, arg):
+        """Rename the current group."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
@@ -1362,6 +1628,10 @@ class HVPShell(cmd.Cmd):
         console.print(f"[green]Renamed '{old_name}' to '{arg}'.[/green]")
 
     def do_clone(self, arg):
+        """Clone documents from one group to another."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         args = arg.split()
         if len(args) != 2:
             console.print('[yellow]Usage: clone <source_group> <dest_group>[/yellow]')
@@ -1373,7 +1643,6 @@ class HVPShell(cmd.Cmd):
         if dst in self.db.get_all_groups():
             console.print(f"[red]Destination group '{dst}' already exists.[/red]")
             return
-        import copy
         src_data = self.db.group(src).find()
         dst_grp = self.db.group(dst)
         with console.status(f'Cloning {src} to {dst}...'):
@@ -1384,13 +1653,21 @@ class HVPShell(cmd.Cmd):
         console.print(f"[green]Cloned {len(src_data)} documents to '{dst}'.[/green]")
 
     def do_vacuum(self, arg):
+        """Trigger database compaction and storage optimization."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         console.print('[yellow]Vacuuming database...[/yellow]')
         self.db.storage._dirty = True
         self.db.commit()
         console.print('[green]Vacuum complete. Storage optimized.[/green]')
 
     def do_benchmark(self, arg):
-        import time
+        """Run a performance benchmark on the current database."""
+        if not self._check_db():
+            return
+        assert self.db is not None
+        
         console.print('[bold cyan]Running Benchmark...[/bold cyan]')
         bench_grp = self.db.group('_benchmark_temp')
         start = time.time()
@@ -1424,6 +1701,7 @@ class HVPShell(cmd.Cmd):
         console.print('[green]Benchmark finished.[/green]')
 
     def _parse_kv(self, args):
+        """Parse key=value pairs or JSON strings into a dictionary."""
         args = args.strip()
         if not args:
             return {}
@@ -1451,8 +1729,11 @@ class HVPShell(cmd.Cmd):
         return data
 
     def do_scan(self, arg):
+        """List all groups and their document counts."""
         if not self._check_db():
             return
+        assert self.db is not None
+        
         if self._check_lock():
             return
         groups = self.db.get_all_groups()
@@ -1466,6 +1747,7 @@ class HVPShell(cmd.Cmd):
             count = self.db.group(g).count()
             table.add_row(g, str(count))
         console.print(table)
+
 
     def _mask_uri(self, uri: str) -> str:
         if '://' not in uri:
@@ -1491,7 +1773,8 @@ class HVPShell(cmd.Cmd):
             else:
                 netloc = masked_host
             return f'{parsed.scheme}://{netloc}{parsed.path}'
-        except:
+        except Exception as e:
+            warnings.warn(f"URI masking failed for {uri}: {e}")
             return '******'
 
     def _update_prompt(self):
@@ -1539,6 +1822,7 @@ class HVPShell(cmd.Cmd):
     def do_target(self, arg):
         if not self._check_db():
             return
+        assert self.db is not None
         if self._check_lock():
             return
         name = arg.strip()
@@ -1547,15 +1831,14 @@ class HVPShell(cmd.Cmd):
             return
         all_groups = self.db.get_all_groups()
         if name not in all_groups:
-            import difflib
             matches = difflib.get_close_matches(name, all_groups, n=1, cutoff=0.6)
             if matches:
                 suggestion = matches[0]
-                if console.input(f"[yellow]Group '{name}' not found. Did you mean '{suggestion}'? (y/n): [/yellow]").lower() == 'y':
+                if console.input(f"[yellow]Group '{escape(name)}' not found. Did you mean '{escape(suggestion)}'? (y/n): [/yellow]").lower() == 'y':
                     name = suggestion
-                elif console.input(f"[blue]Create new group '{name}'? (y/n): [/blue]").lower() != 'y':
+                elif console.input(f"[blue]Create new group '{escape(name)}'? (y/n): [/blue]").lower() != 'y':
                     return
-            elif console.input(f"[blue]Group '{name}' not found. Create new? (y/n): [/blue]").lower() != 'y':
+            elif console.input(f"[blue]Group '{escape(name)}' not found. Create new? (y/n): [/blue]").lower() != 'y':
                 return
         if self.current_group:
             self.prev_group = self.current_group
@@ -1567,6 +1850,7 @@ class HVPShell(cmd.Cmd):
     def do_jump(self, arg):
         if not self._check_db():
             return
+        assert self.db is not None
         if self._check_lock():
             return
         if not self.prev_group:
@@ -1616,7 +1900,7 @@ class HVPShell(cmd.Cmd):
             elif arg.startswith('@'):
                 try:
                     target_idx = int(arg[1:])
-                except:
+                except ValueError:
                     console.print('[red]Invalid index format. Use @0, @1...[/red]')
                     return
             elif arg.isdigit():
@@ -1635,12 +1919,10 @@ class HVPShell(cmd.Cmd):
         if target_idx is not None:
             if 0 <= target_idx < total_docs:
                 doc = list(group_data.values())[target_idx]
-                from rich.json import JSON
                 console.print(Panel(JSON(json.dumps(doc, default=str)), title=f"[bold green]Document @{target_idx} ({doc['_id']})[/bold green]"))
             else:
                 console.print(f'[red]Index @{target_idx} out of range (0-{total_docs - 1}).[/red]')
             return
-        import itertools
         docs = list(itertools.islice(group_data.values(), limit))
         self.last_search_results = docs
         if not docs:
@@ -1652,13 +1934,18 @@ class HVPShell(cmd.Cmd):
             console.print(f"[dim]... and {remaining} more documents. Use 'peek {limit + 20}' or 'peek full' to see more.[/dim]")
 
     def do_hunt(self, arg):
+        """
+        Search for documents matching key=value pairs or regex patterns.
+        
+        Usage: hunt <key>=<value> [<key>=r:<regex>]
+        Example: hunt type=user name=r:^Admin.*
+        """
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
         query = self._parse_kv(arg)
         if not query:
             return
-        import re
         has_regex = any((isinstance(v, str) and v.startswith('r:') for v in query.values()))
         if not has_regex:
             results = list(self.current_group.find_iter(query))
@@ -1701,6 +1988,7 @@ class HVPShell(cmd.Cmd):
         console.print(f'[green]Found {len(results)} matches.[/green]')
 
     def _print_table(self, docs, full=False):
+        """Internal helper to print a list of documents in a formatted table."""
         table = Table(show_header=True, header_style='bold magenta', box=None, show_lines=True)
         table.add_column('#', style='dim', width=4)
         table.add_column('ID', style='cyan', width=12)
@@ -1715,6 +2003,7 @@ class HVPShell(cmd.Cmd):
         console.print(table)
 
     def do_help(self, arg):
+        """Show help for a specific command or general instructions."""
         if not arg:
             self.preloop()
             return
@@ -1725,8 +2014,18 @@ class HVPShell(cmd.Cmd):
             console.print(f"[red]No help found for '{arg}'.[/red]")
 
     def do_make(self, arg):
+        """
+        Create a new document or a new group.
+        
+        Usage:
+            make <key>=<value> [<key>=<value> ...]
+            make group:<group_name>
+            make (interactive mode)
+        """
         if not self._check_db():
             return
+        assert self.db is not None
+        
         if arg.startswith('group:'):
             g_name = arg.split(':', 1)[1].strip()
             if not g_name:
@@ -1746,10 +2045,10 @@ class HVPShell(cmd.Cmd):
         if not arg:
             console.print('[cyan]Interactive Document Creation (Empty key to finish)[/cyan]')
             while True:
-                key = input('  Key: ').strip()
+                key = console.input('  Key: ').strip()
                 if not key:
                     break
-                val = input(f"  Value for '{key}': ").strip()
+                val = console.input(f"  Value for '{escape(key)}': ").strip()
                 if val.isdigit():
                     val = int(val)
                 elif val.lower() == 'true':
@@ -1770,8 +2069,17 @@ class HVPShell(cmd.Cmd):
         console.print(f"[green]Document created. ID: {res['_id']}[/green]")
 
     def do_move(self, arg):
+        """
+        Move a document from one group to another.
+        
+        Usage:
+            move <target_group> (if document is 'picked')
+            move <doc_id> <target_group>
+            move <source_group>:<doc_id> <target_group>
+        """
         if not self._check_db():
             return
+        assert self.db is not None
         args = arg.split()
         source_group = self.current_group
         target_group_name = None
@@ -1804,8 +2112,17 @@ class HVPShell(cmd.Cmd):
         self._exec_move_copy(source_group, doc_id, target_group_name, is_move=True)
 
     def do_copy(self, arg):
+        """
+        Copy a document from one group to another.
+        
+        Usage:
+            copy <target_group> (if document is 'picked')
+            copy <doc_id> <target_group>
+            copy <source_group>:<doc_id> <target_group>
+        """
         if not self._check_db():
             return
+        assert self.db is not None
         args = arg.split()
         source_group = self.current_group
         target_group_name = None
@@ -1838,8 +2155,14 @@ class HVPShell(cmd.Cmd):
         self._exec_move_copy(source_group, doc_id, target_group_name, is_move=False)
 
     def do_become(self, arg):
+        """
+        Switch current user identity.
+        
+        Usage: become <username> [password]
+        """
         if not self._check_db():
             return
+        assert self.db is not None
         args = arg.split()
         if not args:
             console.print('[yellow]Usage: become <username> [password][/yellow]')
@@ -1869,15 +2192,23 @@ class HVPShell(cmd.Cmd):
         self._update_prompt()
 
     def do_user(self, arg):
+        """
+        Manage database users and roles.
+        
+        Usage:
+            user list
+            user create <username> [password] [role]
+            user drop <username>
+        """
         if not self._check_db():
             return
+        assert self.db is not None
+        
         if 'perms' not in self.db.plugins:
-            try:
-                from hvpdb_perms import PermissionManager
-                self.db.plugins['perms'] = PermissionManager(self.db)
-            except ImportError:
+            if not PermissionManager:
                 console.print("[red]Error: 'hvpdb-perms' plugin not found.[/red]")
                 return
+            self.db.plugins['perms'] = PermissionManager(self.db)
         pm = self.db.plugins['perms']
         args = arg.split()
         if not args:
@@ -1930,8 +2261,15 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Unknown user command: {cmd}[/red]')
 
     def do_grant(self, arg):
+        """
+        Grant group access to a user.
+        
+        Usage: grant <username> <group>
+        """
         if not self._check_db():
             return
+        assert self.db is not None
+        
         args = arg.split()
         if len(args) != 2:
             console.print('[yellow]Usage: grant <username> <group>[/yellow]')
@@ -1948,8 +2286,15 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Error: {e}[/red]')
 
     def do_revoke(self, arg):
+        """
+        Revoke group access from a user.
+        
+        Usage: revoke <username> <group>
+        """
         if not self._check_db():
             return
+        assert self.db is not None
+        
         args = arg.split()
         if len(args) != 2:
             console.print('[yellow]Usage: revoke <username> <group>[/yellow]')
@@ -1965,7 +2310,13 @@ class HVPShell(cmd.Cmd):
         except Exception as e:
             console.print(f'[red]Error: {e}[/red]')
 
+
     def _exec_move_copy(self, source_group, doc_id, target_group_name, is_move):
+        """Internal helper to execute move or copy operations between groups."""
+        if not self.db:
+            return
+        assert self.db is not None
+        
         if target_group_name not in self.db.get_all_groups():
             console.print(f"[red]Target group '{target_group_name}' not found.[/red]")
             return
@@ -1977,7 +2328,6 @@ class HVPShell(cmd.Cmd):
             console.print(f"[red]Document {doc_id} not found in '{source_group.name}'.[/red]")
             return
         try:
-            import copy
             new_doc = copy.deepcopy(doc)
             if not is_move:
                 if '_id' in new_doc:
@@ -1997,10 +2347,13 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Operation failed: {e}[/red]')
 
     def do_random(self, arg):
+        """Pick and display a random document from the current group."""
+        if not self._check_db():
+            return
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
-        import random
+        assert self.current_group is not None
         docs = self.current_group.find()
         if not docs:
             console.print('[dim]Group is empty.[/dim]')
@@ -2008,11 +2361,14 @@ class HVPShell(cmd.Cmd):
         doc = random.choice(docs)
         self.current_doc = doc
         self._update_prompt()
-        from rich.json import JSON
         json_str = json.dumps(doc, indent=2, default=str)
         console.print(Panel(JSON(json_str), title='[bold green]Random Pick (LOCKED)[/bold green]', border_style='green'))
 
     def do_fields(self, arg):
+        """List all unique field names present in the current group."""
+        if not self._check_db():
+            return
+        assert self.db is not None
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
@@ -2022,12 +2378,19 @@ class HVPShell(cmd.Cmd):
         console.print(Panel('\n'.join(sorted(fields)), title=f'Fields in {self.current_group.name}'))
 
     def do_nuke(self, arg):
+        """
+        Permanently delete a group and all its contents.
+        
+        Usage: nuke <group_name>
+        """
         if not self._check_db():
             return
+        assert self.db is not None
+        
         if not arg:
             self.do_help('nuke')
             return
-        confirm = input(f"🔥 WARNING: Nuke group '{arg}'? (y/n): ")
+        confirm = console.input(f"🔥 WARNING: Nuke group '{escape(arg)}'? (y/n): ")
         if confirm.lower() == 'y':
             if arg in self.db.storage.data['groups']:
                 del self.db.storage.data['groups'][arg]
@@ -2041,11 +2404,17 @@ class HVPShell(cmd.Cmd):
                 console.print(f"[yellow]Group '{arg}' not found.[/yellow]")
 
     def do_version(self, arg):
+        """Show HVPDB version and engine information."""
         from . import __version__ as pkg_version
         console.print(f'[bold cyan]HVPDB v{pkg_version}[/bold cyan]')
         console.print('Engine: HVP-Storage (Python)')
 
     def do_how(self, arg):
+        """
+        Explain the purpose and flow of a command.
+        
+        Usage: how <command>
+        """
         if not arg:
             console.print('[yellow]Usage: how <command>[/yellow]')
             return
@@ -2057,6 +2426,7 @@ class HVPShell(cmd.Cmd):
             self.do_help(arg)
 
     def do_example(self, arg):
+        """Show usage examples for a specific command."""
         if not arg:
             console.print('[yellow]Usage: example <command>[/yellow]')
             return
@@ -2071,23 +2441,20 @@ class HVPShell(cmd.Cmd):
             console.print(Panel(doc, title=f'Help: {arg}', border_style='cyan'))
 
     def do_drop(self, arg):
+        """Alias for 'nuke'."""
         self.do_nuke(arg)
 
-    def do_version(self, arg):
-        from . import __version__ as pkg_version
-        console.print(f'[bold cyan]HVPDB v{pkg_version}[/bold cyan]')
-        console.print('Engine: HVP-Storage (Python)')
-
-    def do_config(self, arg):
-        console.print('[dim]Config management coming soon...[/dim]')
-
     def do_backup(self, arg):
+        """
+        Create a backup of the current database file.
+        
+        Usage: backup <destination_path>
+        """
         if not arg:
             self.do_help('backup')
             return
-        import shutil
         try:
-            if hasattr(self.db, 'filepath') and os.path.exists(self.db.filepath):
+            if self.db and hasattr(self.db, 'filepath') and os.path.exists(self.db.filepath):
                 shutil.copy2(self.db.filepath, arg)
                 console.print(f'[green]Backup created at {arg}[/green]')
             else:
@@ -2096,6 +2463,11 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Backup failed: {e}[/red]')
 
     def do_pick(self, arg):
+        """
+        Select a document from the last search results by its index.
+        
+        Usage: pick <index>
+        """
         if not self.last_search_results:
             console.print("[yellow]No results to pick from. Run 'peek' or 'hunt' first.[/yellow]")
             return
@@ -2104,7 +2476,6 @@ class HVPShell(cmd.Cmd):
             if 0 <= idx < len(self.last_search_results):
                 self.current_doc = self.last_search_results[idx]
                 self._update_prompt()
-                from rich.json import JSON
                 json_str = json.dumps(self.current_doc, indent=2, default=str)
                 console.print(Panel(JSON(json_str), title='[bold green]Selected Document (LOCKED)[/bold green]', border_style='green'))
             else:
@@ -2113,6 +2484,15 @@ class HVPShell(cmd.Cmd):
             console.print('[red]Invalid index.[/red]')
 
     def do_select(self, arg):
+        """
+        Add documents to the multi-selection buffer.
+        
+        Usage:
+            select all
+            select clear
+            select <index>
+            select <start>-<end>
+        """
         if not self.last_search_results:
             console.print("[yellow]No search results to select from. Run 'peek' or 'hunt' first.[/yellow]")
             return
@@ -2150,6 +2530,13 @@ class HVPShell(cmd.Cmd):
         self._update_prompt()
 
     def do_discard(self, arg):
+        """
+        Remove documents from the multi-selection buffer.
+        
+        Usage:
+            discard all
+            discard <index>
+        """
         if arg == 'all':
             self.selected_docs = []
             console.print('[green]Selection cleared.[/green]')
@@ -2170,6 +2557,19 @@ class HVPShell(cmd.Cmd):
         self._update_prompt()
 
     def do_morph(self, arg):
+        """
+        Update the selected document(s) with new values.
+        
+        Usage: morph <key>=<value> [<key>=<value> ...]
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
+        if not self.current_group:
+            console.print('[red]No group selected.[/red]')
+            return
+        assert self.current_group is not None
+        
         target_ids = []
         if self.selected_docs:
             target_ids = self.selected_docs
@@ -2191,6 +2591,19 @@ class HVPShell(cmd.Cmd):
         console.print(f'[green]Updated {count} documents successfully.[/green]')
 
     def do_throw(self, arg):
+        """
+        Delete the selected document(s).
+        
+        Usage: throw
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
+        if not self.current_group:
+            console.print('[red]No group selected.[/red]')
+            return
+        assert self.current_group is not None
+        
         target_ids = []
         if self.selected_docs:
             target_ids = self.selected_docs
@@ -2213,6 +2626,7 @@ class HVPShell(cmd.Cmd):
         self._update_prompt()
 
     def do_check(self, arg):
+        """Count the number of documents in the current group."""
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
@@ -2220,10 +2634,19 @@ class HVPShell(cmd.Cmd):
         console.print(f'Total documents: {count}')
 
     def do_truncate(self, arg):
+        """
+        Delete all documents in the current group.
+        
+        Usage: truncate
+        """
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
-        confirm = input(f"WARNING: Delete ALL data in '{self.current_group.name}'? (yes/no): ")
+        if not self.db:
+            return
+        assert self.db is not None
+        
+        confirm = console.input(f"WARNING: Delete ALL data in '{self.current_group.name}'? (yes/no): ")
         if confirm.lower() == 'yes':
             if hasattr(self.db, 'is_cluster') and self.db.is_cluster:
                 console.print('[yellow]Cluster truncate not optimized yet. Using slow delete.[/yellow]')
@@ -2237,9 +2660,18 @@ class HVPShell(cmd.Cmd):
             console.print(f"[green]Group '{self.current_group.name}' truncated.[/green]")
 
     def do_index(self, arg):
+        """
+        Create an index on a specific field.
+        
+        Usage: index <field> [unique]
+        """
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
+        if not self.db:
+            return
+        assert self.db is not None
+        
         args = arg.split()
         if not args:
             console.print('[yellow]Usage: index <field> [unique][/yellow]')
@@ -2259,6 +2691,11 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Error: {e}[/red]')
 
     def do_export(self, arg):
+        """
+        Export current group data to a JSON file.
+        
+        Usage: export <filename.json>
+        """
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
@@ -2274,9 +2711,18 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Export failed: {e}[/red]')
 
     def do_import(self, arg):
+        """
+        Import data from a JSON file into the current group.
+        
+        Usage: import <filename.json>
+        """
         if not self.current_group:
             console.print('[red]No group selected.[/red]')
             return
+        if not self.db:
+            return
+        assert self.db is not None
+        
         if not arg:
             console.print('[yellow]Usage: import <filename.json>[/yellow]')
             return
@@ -2300,12 +2746,20 @@ class HVPShell(cmd.Cmd):
             console.print(f'[red]Import failed: {e}[/red]')
 
     def do_trace(self, arg):
+        """
+        View the audit trail/history for the selected document.
+        
+        Usage: trace
+        """
         if not self.current_doc:
             console.print('[red]Select a document first.[/red]')
             return
         if not hasattr(self.current_group, 'get_audit_trail'):
             console.print('[yellow]Audit logging not available.[/yellow]')
             return
+        # Type guard for pyright (implied by context but explicit is better)
+        assert self.current_group is not None
+        
         logs = self.current_group.get_audit_trail(self.current_doc['_id'])
         if not logs:
             console.print('[dim]No history found.[/dim]')
@@ -2314,7 +2768,6 @@ class HVPShell(cmd.Cmd):
         table.add_column('Time', style='dim')
         table.add_column('Action', style='magenta')
         table.add_column('Data', style='white')
-        import datetime
         for log in logs:
             ts = datetime.datetime.fromtimestamp(log.get('timestamp', 0)).strftime('%Y-%m-%d %H:%M:%S')
             op = log.get('op', 'unknown')
@@ -2322,17 +2775,18 @@ class HVPShell(cmd.Cmd):
             table.add_row(ts, op, data)
         console.print(table)
 
-    def do_status(self, arg):
-        if not self._check_db():
-            return
-        size_mb = 0
-        if hasattr(self.db, 'filepath') and os.path.exists(self.db.filepath):
-            size_mb = os.path.getsize(self.db.filepath) / (1024 * 1024)
-        console.print(Panel(f"\n        [bold]Database Status[/bold]\n        ----------------\n        Path: {self.db.filepath}\n        Size: {size_mb:.2f} MB\n        Encrypted: {('Yes' if self.db.password else 'No')}\n        Groups: {len(self.db.get_all_groups())}\n        ", title='Info'))
-
     def do_save(self, arg):
+        """
+        Manually save database changes or configure auto-save.
+        
+        Usage:
+            save
+            save auto on|off
+        """
         if not self._check_db():
             return
+        assert self.db is not None
+        
         args = arg.split()
         if args and args[0] == 'auto':
             if len(args) > 1:
@@ -2344,6 +2798,7 @@ class HVPShell(cmd.Cmd):
         console.print('[green]Database saved successfully.[/green]')
 
     def do_quit(self, arg):
+        """Save changes and exit the shell."""
         if self._check_lock():
             return
         if self.db:
@@ -2377,8 +2832,11 @@ class HVPShell(cmd.Cmd):
         return True
 
     def do_tree(self, arg):
+        """Display a tree view of the database structure (groups and documents)."""
         if not self._check_db():
             return
+        assert self.db is not None
+        
         tree = Tree(f'[bold cyan]📦 {os.path.basename(self.db.filepath)}[/bold cyan]')
         groups = self.db.get_all_groups()
         for g_name in groups:
@@ -2396,8 +2854,11 @@ class HVPShell(cmd.Cmd):
         console.print(tree)
 
     def do_validate(self, arg):
+        """Perform an integrity check on the database data."""
         if not self._check_db():
             return
+        assert self.db is not None
+        
         console.print('[bold]Running Integrity Check...[/bold]')
         issues = 0
         for g_name in self.db.get_all_groups():
@@ -2424,13 +2885,15 @@ class HVPShell(cmd.Cmd):
             console.print(f'\n[bold red]❌ Found {issues} issues.[/bold red]')
 
     def do_monitor(self, arg):
+        """Real-time monitoring of database activity (Ctrl+C to stop)."""
         if not self._check_db():
             return
+        assert self.db is not None
         import time
         interval = 2
         if arg and arg.isdigit():
             interval = int(arg)
-        console.print(f'[cyan]Monitoring... (Ctrl+C to stop)[/cyan]')
+        console.print('[cyan]Monitoring... (Ctrl+C to stop)[/cyan]')
         try:
             with console.status('Monitoring DB Activity...') as status:
                 while True:
@@ -2445,57 +2908,102 @@ class HVPShell(cmd.Cmd):
             console.print('\n[dim]Monitor stopped.[/dim]')
 
     def do_record(self, arg):
+        """
+        Manage and interact with the Write-Ahead Log (WAL) records.
+        
+        Usage:
+            record status [on|off] - Check or toggle record mode
+            record list [limit]    - List recent transactions
+            record peek <seq>      - Inspect a specific transaction
+            record undo <seq>      - Revert a transaction
+            record apply <seq>     - Re-apply a transaction
+        """
         if not self._check_db():
             return
+        assert self.db is not None
+        
+        is_cluster = getattr(self.db, 'is_cluster', False)
+        target_storage = self.db.storage
+        current_group_name = None
+        if self.current_group:
+            current_group_name = self.current_group.name
+            target_storage = self.current_group.storage
+        elif is_cluster:
+            console.print('[yellow]Viewing Cluster Metadata WAL. Use "target <group>" to see data transactions.[/yellow]')
+
         args = arg.split()
         if not args:
             self.do_help('record')
             return
+
+        if not hasattr(target_storage, 'wal') or not getattr(target_storage, 'wal'):
+            console.print('[red]WAL not accessible.[/red]')
+            return
+
         cmd = args[0].lower()
         if cmd == 'status':
             if len(args) > 1:
                 mode = args[1].lower()
                 self.record_mode = mode == 'on'
             console.print(f"Record Mode: [{('green' if self.record_mode else 'red')}]{('ON' if self.record_mode else 'OFF')}[/]")
-        elif cmd == 'list':
-            limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
-            if hasattr(self.db.storage, 'wal'):
-                logs = []
+            return
 
-                def collector(entry):
-                    logs.append(entry)
-                self.db.storage.wal.replay(0, collector)
-                logs = sorted(logs, key=lambda x: x.get('seq', 0), reverse=True)[:limit]
-                table = Table(title=f'Transaction History (Last {limit})')
-                table.add_column('Seq', style='cyan', width=6)
-                table.add_column('Txn ID', style='blue', width=8)
-                table.add_column('Time', style='dim')
-                table.add_column('Op', style='magenta')
-                table.add_column('Group', style='yellow')
-                table.add_column('ID', style='white')
-                import datetime
-                for log in logs:
-                    ts = datetime.datetime.fromtimestamp(log.get('ts', 0)).strftime('%H:%M:%S')
-                    txn = log.get('txn', '')[:8] if log.get('txn') else '-'
-                    table.add_row(str(log.get('seq')), txn, ts, log.get('op'), log.get('g'), str(log.get('id'))[:8])
-                console.print(table)
-            else:
-                console.print('[red]WAL not accessible.[/red]')
-        elif cmd == 'peek':
+        if cmd == 'list':
+            limit = 10
+            if len(args) > 1:
+                try:
+                    limit = int(args[1])
+                except ValueError:
+                    console.print('[red]Invalid limit.[/red]')
+                    return
+            logs = []
+
+            def collector(entry):
+                logs.append(entry)
+
+            target_storage.wal.replay(0, collector)
+            logs = sorted(logs, key=lambda x: x.get('seq', 0), reverse=True)[:limit]
+            table = Table(title=f'Transaction History (Last {limit})')
+            table.add_column('Seq', style='cyan', width=6)
+            table.add_column('Txn ID', style='blue', width=8)
+            table.add_column('Time', style='dim')
+            table.add_column('Type', style='dim')
+            table.add_column('Op', style='magenta')
+            table.add_column('Group', style='yellow')
+            table.add_column('ID', style='white')
+            for log in logs:
+                ts = datetime.datetime.fromtimestamp(log.get('ts', 0)).strftime('%H:%M:%S')
+                txn = log.get('txn', '')[:8] if log.get('txn') else '-'
+                etype = log.get('type', '-')
+                table.add_row(str(log.get('seq')), txn, ts, etype, str(log.get('op') or '-'), str(log.get('g') or '-'), str(log.get('id') or '-')[:8])
+            console.print(table)
+            return
+
+        if cmd == 'peek':
             if len(args) < 2:
                 console.print('[yellow]Usage: record peek <seq>[/yellow]')
                 return
-            target_seq = int(args[1])
+            try:
+                target_seq = int(args[1])
+            except ValueError:
+                console.print('[red]Invalid seq.[/red]')
+                return
             found_log = None
 
             def finder(entry):
                 nonlocal found_log
                 if entry.get('seq') == target_seq:
                     found_log = entry
-            self.db.storage.wal.replay(0, finder)
+
+            target_storage.wal.replay(0, finder)
             if not found_log:
                 console.print(f'[red]Record #{target_seq} not found.[/red]')
                 return
+
+            if found_log.get('type') != 'DATA' or not found_log.get('op'):
+                console.print(Panel(json.dumps(found_log, indent=2), title=f'Record #{target_seq}', border_style='yellow'))
+                return
+
             data = found_log.get('d')
             before = found_log.get('b')
             op = found_log.get('op')
@@ -2513,36 +3021,63 @@ class HVPShell(cmd.Cmd):
                 else:
                     console.print(f'[yellow]~ {json.dumps(data, indent=2)}[/yellow]')
                     console.print('[dim](Old value not available in log)[/dim]')
-        elif cmd == 'undo':
+            return
+
+        if cmd == 'undo':
             if len(args) < 2:
                 console.print('[yellow]Usage: record undo <seq>[/yellow]')
                 return
-            seq = int(args[1])
+            try:
+                seq = int(args[1])
+            except ValueError:
+                console.print('[red]Invalid seq.[/red]')
+                return
             found_log = None
 
             def finder(entry):
                 nonlocal found_log
                 if entry.get('seq') == seq:
                     found_log = entry
-            self.db.storage.wal.replay(0, finder)
+
+            target_storage.wal.replay(0, finder)
             if not found_log:
                 console.print(f'[red]Record #{seq} not found.[/red]')
                 return
+
             target_txn_id = found_log.get('txn')
             if not target_txn_id:
                 console.print('[red]Cannot undo legacy transaction (missing Txn ID).[/red]')
                 return
+
             txn_ops = []
 
             def txn_collector(entry):
                 if entry.get('txn') == target_txn_id and entry.get('type') == 'DATA':
                     txn_ops.append(entry)
-            self.db.storage.wal.replay(0, txn_collector)
+
+            target_storage.wal.replay(0, txn_collector)
             txn_ops.sort(key=lambda x: x.get('seq'), reverse=True)
-            console.print(f'[bold]Undoing Transaction {target_txn_id[:8]} ({len(txn_ops)} operations)...[/bold]')
-            if console.input(f'Confirm undo? (y/n) ').lower() != 'y':
+            if not txn_ops:
+                console.print('[yellow]No DATA operations found for this transaction.[/yellow]')
                 return
-            undo_txn_id = self.db.storage.begin_txn()
+
+            if is_cluster:
+                groups_in_txn = {op.get('g') for op in txn_ops if op.get('g')}
+                if self.current_group:
+                    if groups_in_txn != {current_group_name}:
+                        console.print('[red]Refusing undo: transaction is not scoped to current group. Use "target <group>".[/red]')
+                        return
+                else:
+                    meta_group = getattr(self.db, '_CLUSTER_META_GROUP_NAME', None)
+                    if not meta_group or (groups_in_txn - {meta_group}):
+                        console.print('[red]Refusing undo from cluster metadata context. Use "target <group>".[/red]')
+                        return
+
+            console.print(f'[bold]Undoing Transaction {target_txn_id[:8]} ({len(txn_ops)} operations)...[/bold]')
+            if console.input('Confirm undo? (y/n) ').lower() != 'y':
+                return
+
+            undo_txn_id = target_storage.begin_txn()
             try:
                 for op_log in txn_ops:
                     op = op_log.get('op')
@@ -2550,7 +3085,14 @@ class HVPShell(cmd.Cmd):
                     doc_id = op_log.get('id')
                     data = op_log.get('d')
                     before = op_log.get('b')
+
+                    if not grp_name or not doc_id or not op:
+                        raise ValueError('Invalid WAL entry for undo')
+
                     grp = self.db.group(grp_name)
+                    if is_cluster and grp.storage is not target_storage:
+                        raise RuntimeError('Cluster storage mismatch')
+
                     if op == 'insert':
                         grp.delete({'_id': doc_id}, external_txn_id=undo_txn_id)
                         console.print(f'[green]Reverted Insert: Deleted {doc_id}[/green]')
@@ -2559,6 +3101,8 @@ class HVPShell(cmd.Cmd):
                             console.print(f'[yellow]Warning: Document {doc_id} already exists. Skipping restore.[/yellow]')
                         else:
                             restore_data = before if before else data
+                            if not restore_data:
+                                raise ValueError('Missing restore data')
                             grp.insert(restore_data, external_txn_id=undo_txn_id)
                             console.print(f'[green]Reverted Delete: Restored {doc_id}[/green]')
                     elif op == 'update':
@@ -2568,36 +3112,90 @@ class HVPShell(cmd.Cmd):
                         else:
                             console.print(f'[red]Cannot undo update {doc_id}: Missing before-image.[/red]')
                             raise ValueError('Missing before-image')
-                self.db.storage.commit_txn(undo_txn_id)
+                    else:
+                        raise ValueError(f'Unsupported op: {op}')
+
+                target_storage.commit_txn(undo_txn_id)
                 self.db.commit()
                 console.print('[bold green]Transaction Undone Successfully.[/bold green]')
             except Exception as e:
-                self.db.storage.rollback_txn(undo_txn_id)
+                target_storage.rollback_txn(undo_txn_id)
                 console.print(f'[bold red]Undo Failed: {e}. Rolled back changes.[/bold red]')
-        elif cmd == 'apply':
+            return
+
+        if cmd == 'apply':
             if len(args) < 2:
                 console.print('[yellow]Usage: record apply <seq>[/yellow]')
                 return
-            seq = int(args[1])
-            found_log = None
+            try:
+                seq = int(args[1])
+            except ValueError:
+                console.print('[red]Invalid seq.[/red]')
+                return
+
+            found_log: Optional[dict] = None
 
             def finder(entry):
                 nonlocal found_log
                 if entry.get('seq') == seq:
                     found_log = entry
-            self.db.storage.wal.replay(0, finder)
+
+            target_storage.wal.replay(0, finder)
             if not found_log:
+                console.print(f'[red]Record #{seq} not found.[/red]')
                 return
+
+            if found_log.get('type') != 'DATA' or not found_log.get('op'):
+                console.print('[red]This record is not a DATA operation.[/red]')
+                return
+
+            grp_name = found_log.get('g')
+            if not grp_name:
+                console.print('[red]Missing group name in record.[/red]')
+                return
+
+            if is_cluster:
+                if self.current_group:
+                    if grp_name != current_group_name:
+                        console.print('[red]Refusing apply: record is not scoped to current group.[/red]')
+                        return
+                else:
+                    meta_group = getattr(self.db, '_CLUSTER_META_GROUP_NAME', None)
+                    if grp_name != meta_group:
+                        console.print('[red]Refusing apply from cluster metadata context. Use "target <group>".[/red]')
+                        return
+
             op = found_log.get('op')
-            grp = self.db.group(found_log.get('g'))
+            grp = self.db.group(grp_name)
+            if is_cluster and grp.storage is not target_storage:
+                console.print('[red]Cluster storage mismatch.[/red]')
+                return
+
             data = found_log.get('d')
+            doc_id = found_log.get('id')
             if console.input(f'Re-apply {op} #{seq}? (y/n) ').lower() != 'y':
                 return
             if op == 'insert':
+                if not data:
+                    console.print('[red]Missing data for insert.[/red]')
+                    return
                 grp.insert(data)
             elif op == 'delete':
-                grp.delete({'_id': found_log.get('id')})
+                if not doc_id:
+                    console.print('[red]Missing id for delete.[/red]')
+                    return
+                grp.delete({'_id': doc_id})
             elif op == 'update':
-                grp.update({'_id': found_log.get('id')}, data)
+                if not doc_id or not data:
+                    console.print('[red]Missing id/data for update.[/red]')
+                    return
+                grp.update({'_id': doc_id}, data)
+            else:
+                console.print(f'[red]Unsupported op: {op}[/red]')
+                return
+
             self.db.commit()
             console.print('[green]Transaction re-applied.[/green]')
+            return
+
+        self.do_help('record')

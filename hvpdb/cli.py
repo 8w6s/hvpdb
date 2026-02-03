@@ -1,24 +1,27 @@
-import sys
-import os
-import stat
-import json
-import ast
-from typing import Optional
+import datetime
 import difflib
+import json
+import os
+import shutil
+import sys
+import warnings
+import zipfile
+from typing import Optional
+
 try:
     import typer
     from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
     from rich.json import JSON
+    from rich.panel import Panel
+    from rich.table import Table
 except ImportError:
     print('Error: CLI dependencies not found.')
     print('Please install with: pip install hvpdb[cli] or pip install typer rich')
     sys.exit(1)
 from .core import HVPDB
-from .uri import HVPURI
-from .utils import redact_target, normalize_target
 from .diagnostics import Diagnostics
+from .utils import normalize_target, redact_target
+
 try:
     if sys.version_info < (3, 10):
         from importlib_metadata import entry_points
@@ -30,7 +33,27 @@ app = typer.Typer(help='HVPDB CLI - High Velocity Python Database', no_args_is_h
 console = Console()
 PLUGINS = {}
 
+def version_callback(value: bool):
+    if value:
+        from . import __version__
+        console.print(f"HVPDB CLI Version: {__version__}")
+        raise typer.Exit()
+
+@app.callback()
+def main(
+    version: Optional[bool] = typer.Option(
+        None, "--version", "-v", help="Show the application's version and exit.", callback=version_callback, is_eager=True
+    )
+):
+    """
+    HVPDB - High Velocity Python Database CLI
+    """
+    pass
+
 def load_plugins():
+    """
+    Dynamically discover and load HVPDB plugins using entry points and local modules.
+    """
     if entry_points:
         try:
             eps = entry_points()
@@ -45,10 +68,16 @@ def load_plugins():
                     console.print(f'[yellow]Warning: Failed to load plugin {ep.name}: {e}[/yellow]')
         except Exception as e:
             console.print(f'[red]Plugin discovery error: {e}[/red]')
-    known_extensions = ['hvpdb_query', 'hvpdb_perms', 'hvpdb_http', 'hvpdb_backup', 'hvpdb_migrate', 'hvpdb_observe', 'hvpdb_admin', 'hvpdb_tools', 'hvpdb_sync']
+            
+    known_extensions = [
+        'hvpdb_query', 'hvpdb_perms', 'hvpdb_http', 'hvpdb_backup', 
+        'hvpdb_migrate', 'hvpdb_observe', 'hvpdb_admin', 'hvpdb_tools', 'hvpdb_sync'
+    ]
+    
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+        
     for ext in known_extensions:
         if ext.replace('hvpdb_', '') in PLUGINS:
             continue
@@ -61,22 +90,37 @@ def load_plugins():
                 sys.path.insert(0, plugin_path)
                 try:
                     module = __import__(ext)
-                except ImportError:
+                except ImportError as e:
+                    # Only silently ignore if the module itself is missing
+                    if e.name == ext:
+                        continue
+                    # If the module exists but fails to import (e.g., dependency missing), warn user
+                    console.print(f'[yellow]Warning: Plugin {ext} found but failed to load: {e}[/yellow]')
                     continue
             else:
                 continue
+        except Exception as e:
+             console.print(f'[red]Error loading plugin {ext}: {e}[/red]')
+             continue
         short_name = ext.replace('hvpdb_', '')
         PLUGINS[short_name] = module
+
 load_plugins()
+
 for name, plugin in PLUGINS.items():
     if isinstance(plugin, typer.Typer):
         app.add_typer(plugin, name=name)
     elif hasattr(plugin, 'app') and isinstance(plugin.app, typer.Typer):
         app.add_typer(plugin.app, name=name)
-if 'query' not in PLUGINS:
 
-    @app.command(name='query', help='Polyglot Query Engine (Missing).\n\nRequires: hvpdb-query', context_settings={'allow_extra_args': True, 'ignore_unknown_options': True})
+if 'query' not in PLUGINS:
+    @app.command(
+        name='query', 
+        help='Polyglot Query Engine (Missing).\n\nRequires: hvpdb-query', 
+        context_settings={'allow_extra_args': True, 'ignore_unknown_options': True}
+    )
     def hvpdb_query_placeholder(ctx: typer.Context):
+        """Placeholder for missing query plugin."""
         console.print("[bold red]Error: 'hvpdb-query' plugin is missing.[/bold red]")
         console.print('This command requires the Polyglot Query Engine.')
         console.print('\n[yellow]To install, run:[/yellow]')
@@ -85,57 +129,100 @@ if 'query' not in PLUGINS:
 
 @app.callback(invoke_without_command=True)
 def hvpdb_main(ctx: typer.Context):
+    """
+    Main callback for the HVPDB CLI.
+    """
     if ctx.invoked_subcommand is None:
         hvpdb_show_help()
 
-def hvpdb_get_db(uri_or_path: str, password: str=None) -> HVPDB:
+def get_db_password() -> str:
+    """
+    Retrieve database password from env or interactive prompt.
+    """
+    password = os.environ.get('HVPDB_PASSWORD')
+    if not password:
+        password = typer.prompt('Database Password', hide_input=True)
+    return password
+
+def hvpdb_get_db(uri_or_path: str, password: Optional[str]=None) -> HVPDB:
+    """
+    Establish a connection to HVPDB with integrated error handling.
+    """
     try:
         if '://' in uri_or_path and '@' in uri_or_path:
             from urllib.parse import urlparse
             try:
                 p = urlparse(uri_or_path)
                 if p.password:
-                    console.print(f'[bold red]SECURITY ERROR:[/bold red] Password embedded in URI is insecure.')
+                    console.print('[bold red]SECURITY ERROR:[/bold red] Password embedded in URI is insecure.')
                     console.print('[yellow]Please use environment variable HVPDB_PASSWORD or interactive prompt.[/yellow]')
                     raise typer.Exit(code=1)
-            except Exception:
-                pass
+            except Exception as e:
+                warnings.warn(f"URI security check failed for {uri_or_path}: {e}")
+                scheme_sep = uri_or_path.find('://')
+                if scheme_sep != -1:
+                    at = uri_or_path.find('@', scheme_sep + 3)
+                    if at != -1:
+                        userinfo = uri_or_path[scheme_sep + 3 : at]
+                        if ':' in userinfo:
+                            console.print('[bold red]SECURITY ERROR:[/bold red] Password embedded in URI is insecure.')
+                            console.print('[yellow]Please use environment variable HVPDB_PASSWORD or interactive prompt.[/yellow]')
+                            raise typer.Exit(code=1)
+                
         if not password:
             password = os.environ.get('HVPDB_PASSWORD')
-        if not uri_or_path.startswith('hvp://') and (not password):
-            pass
+            
         return HVPDB(uri_or_path, password)
     except Exception as e:
+        # Retry with prompt if password seems wrong or missing
         if 'BadDecrypt' in str(e) or 'password' in str(e).lower():
             console.print('[yellow]Authentication failed or password missing.[/yellow]')
             password = typer.prompt('Enter Database Password', hide_input=True)
             return HVPDB(uri_or_path, password)
+            
         safe_msg = str(e).replace(uri_or_path, redact_target(uri_or_path))
         console.print(f'[bold red]Connection Error:[/bold red] {safe_msg}')
         raise typer.Exit(code=1)
 
 @app.command(name='init', help='Initialize a new database.\n\nUsage: hvpdb init <target> [password]')
-def hvpdb_init(target: str=typer.Argument(..., help='File path or URI'), password: Optional[str]=typer.Argument(None, help='Password (Optional - Recommended to omit and use prompt)')):
-    if not target.startswith('hvp://') and (not target.endswith('.hvp')) and (not target.endswith('.hvdb')):
+def hvpdb_init(
+    target: str = typer.Argument(..., help='File path or URI'), 
+    password: Optional[str] = typer.Argument(None, help='Password (Optional - Recommended to omit and use prompt)')
+):
+    """Command to initialize a new HVPDB instance."""
+    if not target.startswith('hvp://') and not target.endswith('.hvp') and not target.endswith('.hvdb'):
         target += '.hvp'
-    if os.path.exists(target) and (not target.startswith('hvp://')):
+        
+    if os.path.exists(target) and not target.startswith('hvp://'):
         console.print(f'[yellow]File {target} already exists![/yellow]')
         if not typer.confirm('Do you want to overwrite it?'):
             raise typer.Exit()
-    if not target.startswith('hvp://') and (not password):
-        password = typer.prompt('New Password', hide_input=True, confirmation_prompt=True)
-    elif password:
+            
+    final_password = password
+    if not target.startswith('hvp://') and not final_password:
+        final_password = typer.prompt('New Password', hide_input=True, confirmation_prompt=True)
+    elif final_password:
         console.print('[yellow]Warning: Passing password as argument is insecure. Consider using prompt.[/yellow]')
+        
     try:
-        db = HVPDB(target, password)
+        db = HVPDB(target, final_password)
         db.storage.save()
         abs_path = os.path.abspath(db.filepath)
-        console.print(Panel(f'[bold green]Database created successfully![/bold green]\n[bold white]Location:[/bold white] {abs_path}\n[dim]Note: This file is stored in your current project directory.[/dim]', title='Success'))
+        console.print(Panel(
+            f'[bold green]Database created successfully![/bold green]\n'
+            f'[bold white]Location:[/bold white] {abs_path}\n'
+            f'[dim]Note: This file is stored in your current project directory.[/dim]', 
+            title='Success'
+        ))
     except Exception as e:
         console.print(f'[bold red]Init Failed:[/bold red] {e}')
 
 @app.command(name='compact', help='Compact storage.\n\nUsage: hvpdb compact <target> [password]')
-def hvpdb_compact(target: str=typer.Argument(..., help='Database Path'), password: Optional[str]=typer.Argument(None, help='Password')):
+def hvpdb_compact(
+    target: str = typer.Argument(..., help='Database Path'), 
+    password: Optional[str] = typer.Argument(None, help='Password')
+):
+    """Re-save the database to reclaim space and optimize storage."""
     db = hvpdb_get_db(target, password)
     console.print('[yellow]Compacting database...[/yellow]')
     db.storage._dirty = True
@@ -147,7 +234,12 @@ def hvpdb_compact(target: str=typer.Argument(..., help='Database Path'), passwor
     console.print('[bold green]Compaction complete![/bold green]')
 
 @app.command(name='snapshot')
-def hvpdb_snapshot(target: str=typer.Argument(..., help='Database Target'), output: str=typer.Option(..., '--out', '-o', help='Output file path'), password: Optional[str]=typer.Argument(None, help='Password')):
+def hvpdb_snapshot(
+    target: str = typer.Argument(..., help='Database Target'), 
+    output: str = typer.Option(..., '--out', '-o', help='Output file path'), 
+    password: Optional[str] = typer.Argument(None, help='Password')
+):
+    """Create a point-in-time snapshot of the database."""
     db = hvpdb_get_db(target, password)
     db.filepath = output
     db.storage.filepath = output
@@ -156,9 +248,12 @@ def hvpdb_snapshot(target: str=typer.Argument(..., help='Database Target'), outp
     console.print(f'[green]Snapshot saved to {output}[/green]')
 
 @app.command(name='pack')
-def hvpdb_pack(target: str=typer.Argument(..., help='Database Target'), output: str=typer.Option(..., '--out', '-o', help='Output archive (.hvpz)'), password: Optional[str]=typer.Argument(None, help='Password')):
-    import zipfile
-    import datetime
+def hvpdb_pack(
+    target: str = typer.Argument(..., help='Database Target'), 
+    output: str = typer.Option(..., '--out', '-o', help='Output archive (.hvpz)'), 
+    password: Optional[str] = typer.Argument(None, help='Password')
+):
+    """Pack the database and WAL into a single compressed .hvpz archive."""
     target = normalize_target(target)
     if not output.endswith('.hvpz'):
         output += '.hvpz'
@@ -172,23 +267,29 @@ def hvpdb_pack(target: str=typer.Argument(..., help='Database Target'), output: 
             wal_path = target + '.log'
             if os.path.exists(wal_path):
                 zf.write(wal_path, arcname='database.hvp.log')
-            manifest = {'created_at': str(datetime.datetime.now()), 'target': target, 'version': '1.0'}
+            manifest = {
+                'created_at': str(datetime.datetime.now()), 
+                'target': target, 
+                'version': '1.0'
+            }
             zf.writestr('manifest.json', json.dumps(manifest, indent=2))
         console.print(f'[green]Packed to {output}[/green]')
     except Exception as e:
         console.print(f'[red]Pack failed: {e}[/red]')
 
 @app.command(name='doctor')
-def hvpdb_doctor(target: str=typer.Argument(..., help='Database Target')):
+def hvpdb_doctor(target: str = typer.Argument(..., help='Database Target')):
+    """Perform a health check on the database file."""
     diag = Diagnostics(target)
     report = diag.doctor()
     console.print(f"[bold]Target:[/bold] {report['target']}")
     if report['status'] == 'healthy':
-        console.print(f'[green]✓ Status: Healthy[/green]')
+        console.print('[green]✓ Status: Healthy[/green]')
     elif report['status'] == 'missing':
-        console.print(f'[red]✗ Status: Missing[/red]')
+        console.print('[red]✗ Status: Missing[/red]')
     else:
         console.print(f"[red]✗ Status: {report['status']}[/red]")
+        
     if 'wal_header' in report:
         console.print(f"WAL Header: {report['wal_header']}")
     if report['issues']:
@@ -197,23 +298,35 @@ def hvpdb_doctor(target: str=typer.Argument(..., help='Database Target')):
             console.print(f'  - {issue}')
 
 @app.command(name='verify')
-def hvpdb_verify(target: str=typer.Argument(..., help='Database Target'), password: Optional[str]=typer.Argument(None, help='Password'), deep: bool=typer.Option(False, '--deep', help='Deep verification')):
+def hvpdb_verify(
+    target: str = typer.Argument(..., help='Database Target'), 
+    password: Optional[str] = typer.Argument(None, help='Password'), 
+    deep: bool = typer.Option(False, '--deep', help='Deep verification')
+):
+    """Verify database and WAL integrity."""
     if not password:
         password = get_db_password()
     diag = Diagnostics(target, password)
     report = diag.verify(deep=deep)
     console.print_json(data=report)
+
 wal_app = typer.Typer(help='WAL Management')
 app.add_typer(wal_app, name='wal')
 
 @wal_app.command(name='status')
-def wal_status(target: str=typer.Argument(..., help='Database Target')):
+def wal_status(target: str = typer.Argument(..., help='Database Target')):
+    """Show Write-Ahead Log statistics."""
     diag = Diagnostics(target)
     stats = diag.wal_status()
     console.print_json(data=stats)
 
 @wal_app.command(name='dump')
-def wal_dump(target: str=typer.Argument(..., help='Database Target'), password: Optional[str]=typer.Argument(None, help='Password'), limit: int=typer.Option(200, help='Limit entries')):
+def wal_dump(
+    target: str = typer.Argument(..., help='Database Target'), 
+    password: Optional[str] = typer.Argument(None, help='Password'), 
+    limit: int = typer.Option(200, help='Limit entries')
+):
+    """Dump decrypted WAL entries."""
     if not password:
         password = get_db_password()
     diag = Diagnostics(target, password)
@@ -224,7 +337,11 @@ def wal_dump(target: str=typer.Argument(..., help='Database Target'), password: 
         console.print(f'[red]Dump failed: {e}[/red]')
 
 @wal_app.command(name='checkpoint')
-def wal_checkpoint(target: str=typer.Argument(..., help='Database Target'), password: Optional[str]=typer.Argument(None, help='Password')):
+def wal_checkpoint(
+    target: str = typer.Argument(..., help='Database Target'), 
+    password: Optional[str] = typer.Argument(None, help='Password')
+):
+    """Manually flush WAL entries to storage."""
     if not password:
         password = get_db_password()
     diag = Diagnostics(target, password)
@@ -292,11 +409,17 @@ def hvpdb_env():
         console.print('[yellow]Warning: HVPDB_PASSWORD is not set. You will be prompted for passwords.[/yellow]')
 
 @app.command(name='redacted-uri')
-def hvpdb_redacted_uri(target: str=typer.Argument(..., help='URI to redact')):
+def hvpdb_redacted_uri(target: str = typer.Argument(..., help='URI to redact')):
+    """Utility to redact passwords from an HVP connection URI."""
     console.print(redact_target(target))
 
 @app.command(name='create-group', help='Create a new group.\n\nUsage: hvpdb create-group <target> <name> [password]')
-def hvpdb_create_group(target: str=typer.Argument(..., help='Database Path'), name: str=typer.Argument(..., help='Group Name'), password: Optional[str]=typer.Argument(None, help='Password')):
+def hvpdb_create_group(
+    target: str = typer.Argument(..., help='Database Path'), 
+    name: str = typer.Argument(..., help='Group Name'), 
+    password: Optional[str] = typer.Argument(None, help='Password')
+):
+    """Create a new logical group in the database."""
     db = hvpdb_get_db(target, password)
     if name in db.get_all_groups():
         console.print(f"[yellow]Group '{name}' already exists.[/yellow]")
@@ -306,7 +429,12 @@ def hvpdb_create_group(target: str=typer.Argument(..., help='Database Path'), na
     console.print(f"[bold green]Group '{name}' created successfully.[/bold green]")
 
 @app.command(name='drop-group')
-def hvpdb_drop_group(target: str=typer.Argument(..., help='Database Path'), name: str=typer.Argument(..., help='Group Name'), password: Optional[str]=typer.Argument(None, help='Password')):
+def hvpdb_drop_group(
+    target: str = typer.Argument(..., help='Database Path'), 
+    name: str = typer.Argument(..., help='Group Name'), 
+    password: Optional[str] = typer.Argument(None, help='Password')
+):
+    """Delete a group and all its data."""
     db = hvpdb_get_db(target, password)
     if name not in db.get_all_groups():
         console.print(f"[red]Group '{name}' not found.[/red]")
@@ -324,17 +452,17 @@ def hvpdb_drop_group(target: str=typer.Argument(..., help='Database Path'), name
     console.print(f"[bold green]Group '{name}' deleted.[/bold green]")
 
 @app.command(name='drop-db', help='Destroy the database.\n\nUsage: hvpdb drop-db <target>')
-def hvpdb_drop_db(target: str=typer.Argument(..., help='Database Path')):
+def hvpdb_drop_db(target: str = typer.Argument(..., help='Database Path')):
+    """Permanently delete a database and its logs."""
     if not typer.confirm(f"🔥 DANGER: Are you sure you want to DESTROY database '{target}'?"):
         return
-    import shutil
     try:
         if os.path.isdir(target):
             shutil.rmtree(target)
         else:
             if os.path.exists(target):
                 os.remove(target)
-            wal_path = target + '.wal'
+            wal_path = target + '.log'
             if os.path.exists(wal_path):
                 os.remove(wal_path)
         console.print(f"[bold red]Database '{target}' destroyed.[/bold red]")
@@ -342,14 +470,18 @@ def hvpdb_drop_db(target: str=typer.Argument(..., help='Database Path')):
         console.print(f'[red]Error:[/red] {e}')
 
 @app.command(name='restore', help='Restore database from backup.\n\nUsage: hvpdb restore <backup_file> --to <target_path>')
-def hvpdb_restore(backup_file: str=typer.Argument(..., help='Source Backup File'), to: str=typer.Option(..., '--to', help='Target Database Path'), force: bool=typer.Option(False, help='Overwrite existing database')):
+def hvpdb_restore(
+    backup_file: str = typer.Argument(..., help='Source Backup File'), 
+    to: str = typer.Option(..., '--to', help='Target Database Path'), 
+    force: bool = typer.Option(False, help='Overwrite existing database')
+):
+    """Restore a database from a backup file."""
     if not os.path.exists(backup_file):
         console.print(f"[red]Backup file '{backup_file}' not found.[/red]")
         raise typer.Exit(1)
-    if os.path.exists(to) and (not force):
+    if os.path.exists(to) and not force:
         console.print(f"[yellow]Target '{to}' already exists. Use --force to overwrite.[/yellow]")
         raise typer.Exit(1)
-    import shutil
     try:
         shutil.copy2(backup_file, to)
         console.print(f"[bold green]Restored database to '{to}' successfully.[/bold green]")
@@ -357,18 +489,21 @@ def hvpdb_restore(backup_file: str=typer.Argument(..., help='Source Backup File'
         console.print(f'[red]Restore failed: {e}[/red]')
 
 @app.command(name='repair', help='Attempt to repair a corrupted database.\n\nUsage: hvpdb repair <target>')
-def hvpdb_repair(target: str=typer.Argument(..., help='Database Path'), force: bool=typer.Option(False, '--force', help='Force repair even if risky')):
+def hvpdb_repair(
+    target: str = typer.Argument(..., help='Database Path'), 
+    force: bool = typer.Option(False, '--force', help='Force repair even if risky')
+):
+    """Attempt to recover from database or WAL corruption."""
     if not os.path.exists(target):
         console.print(f"[red]Database '{target}' not found.[/red]")
         raise typer.Exit(1)
-    if not force and (not typer.confirm('Repair can be destructive. Continue?')):
+    if not force and not typer.confirm('Repair can be destructive. Continue?'):
         return
     console.print('[yellow]Attempting repair...[/yellow]')
-    wal_path = target + '.wal'
+    wal_path = target + '.log'
     if os.path.exists(wal_path):
         try:
             bak_wal = wal_path + '.bak'
-            import shutil
             shutil.move(wal_path, bak_wal)
             console.print(f'[green]Moved potentially corrupt WAL to {bak_wal}[/green]')
         except Exception as e:
@@ -376,13 +511,22 @@ def hvpdb_repair(target: str=typer.Argument(..., help='Database Path'), force: b
     console.print('[green]Repair attempt complete. Try opening the database now.[/green]')
 
 @app.command(name='meta', help='Manage database metadata.\n\nUsage: hvpdb meta <target> [key] [value]')
-def hvpdb_meta(target: str=typer.Argument(..., help='Database Path'), key: Optional[str]=typer.Argument(None, help='Metadata Key'), value: Optional[str]=typer.Argument(None, help='Metadata Value (Leave empty to show/unset)'), password: Optional[str]=typer.Argument(None, help='Password'), unset: bool=typer.Option(False, '--unset', help='Remove the key')):
+def hvpdb_meta(
+    target: str = typer.Argument(..., help='Database Path'), 
+    key: Optional[str] = typer.Argument(None, help='Metadata Key'), 
+    value: Optional[str] = typer.Argument(None, help='Metadata Value (Leave empty to show/unset)'), 
+    password: Optional[str] = typer.Argument(None, help='Password'), 
+    unset: bool = typer.Option(False, '--unset', help='Remove the key')
+):
+    """View or modify database metadata."""
     db = hvpdb_get_db(target, password)
     if 'meta' not in db.storage.data:
         db.storage.data['meta'] = {}
+        
     if not key:
         console.print(Panel(JSON.from_data(db.storage.data['meta']), title='Database Metadata'))
         return
+        
     if unset:
         if key in db.storage.data['meta']:
             del db.storage.data['meta'][key]
@@ -392,6 +536,7 @@ def hvpdb_meta(target: str=typer.Argument(..., help='Database Path'), key: Optio
         else:
             console.print(f"[yellow]Metadata '{key}' not found.[/yellow]")
         return
+        
     if value:
         db.storage.data['meta'][key] = value
         db.storage._dirty = True
@@ -402,8 +547,9 @@ def hvpdb_meta(target: str=typer.Argument(..., help='Database Path'), key: Optio
         console.print(f'{key}: {val}')
 
 @app.command(name='lock-status')
-def hvpdb_lock_status(target: str=typer.Argument(..., help='Database Path')):
-    files = [target, target + '.wal']
+def hvpdb_lock_status(target: str = typer.Argument(..., help='Database Path')):
+    """Check if database files are currently locked by another process."""
+    files = [target, target + '.log']
     locked = []
     for f in files:
         if not os.path.exists(f):
@@ -413,22 +559,31 @@ def hvpdb_lock_status(target: str=typer.Argument(..., help='Database Path')):
             os.close(fd)
         except OSError:
             locked.append(f)
+            
     if locked:
-        console.print(f'[red]Files locked:[/red]')
-        for l in locked:
-            console.print(f' - {l}')
+        console.print('[red]Files locked:[/red]')
+        for locked_file in locked:
+            console.print(f' - {locked_file}')
         console.print('[yellow]Another process (or this shell) is using them.[/yellow]')
     else:
         console.print('[green]No locks detected (Files are free).[/green]')
 
 @app.command(name='import')
-def hvpdb_import(target: str=typer.Argument(..., help='Database Path'), file: str=typer.Argument(..., help='Input file (JSON)'), group: str=typer.Argument('default', help='Target Group'), password: Optional[str]=typer.Argument(None, help='Password')):
+def hvpdb_import(
+    target: str = typer.Argument(..., help='Database Path'), 
+    file: str = typer.Argument(..., help='Input file (JSON)'), 
+    group: str = typer.Argument('default', help='Target Group'), 
+    password: Optional[str] = typer.Argument(None, help='Password')
+):
+    """Import data from a JSON file into a group."""
     db = hvpdb_get_db(target, password)
     if not os.path.exists(file):
         console.print(f"[red]File '{file}' not found.[/red]")
         return
+    
     with open(file, 'r', encoding='utf-8') as f:
         data = json.load(f)
+    
     if isinstance(data, list):
         count = 0
         with console.status('Importing...'):
@@ -437,11 +592,9 @@ def hvpdb_import(target: str=typer.Argument(..., help='Database Path'), file: st
                     db.group(group).insert(item)
                     count += 1
         db.commit()
-        console.print(f"[bold green]Imported {count} documents into group '{group}'.[/bold green]")
-    elif isinstance(data, dict):
-        pass
+        console.print(f"[green]Imported {count} items into group '{group}'.[/green]")
     else:
-        console.print('[red]Invalid JSON format. Expected list of objects.[/red]')
+        console.print('[red]Input file must contain a list of objects.[/red]')
 
 @app.command(name='insert', help='Insert a document.\n\nUsage: hvpdb insert <target> <group> <data> [password]')
 def hvpdb_insert(target: str=typer.Argument(..., help='File path or URI'), group: str=typer.Argument(..., help='Group name'), data: str=typer.Argument(..., help='JSON data string'), password: Optional[str]=typer.Argument(None, help='Password')):
@@ -456,7 +609,7 @@ def hvpdb_insert(target: str=typer.Argument(..., help='File path or URI'), group
             raise ValueError('Data must be a dictionary')
         res = db.group(group).insert(doc)
         db.commit()
-        console.print(f'[bold green]✅ Inserted:[/bold green]')
+        console.print('[bold green]✅ Inserted:[/bold green]')
         console.print(JSON.from_data(res))
     except Exception as e:
         console.print(f'[bold red]❌ Invalid Data:[/bold red] {e}')
@@ -502,13 +655,51 @@ def hvpdb_passwd(target: str=typer.Argument(..., help='File path or URI'), passw
     db.commit()
     console.print('[bold green]Password changed successfully![/bold green]')
 
+@app.command(name='gen-key', help='Generate a new Access Key.')
+def hvpdb_gen_key(
+    qr: bool = typer.Option(False, '--qr', help='Show QR code'),
+    save: Optional[str] = typer.Option(None, '--save', help='Save to file')
+):
+    """Generate a secure Access Key."""
+    import secrets
+    import string
+    
+    alphabet = string.ascii_letters + string.digits
+    key = ''.join(secrets.choice(alphabet) for i in range(64))
+    
+    console.print(Panel(f'[bold green]{key}[/bold green]', title='New Access Key'))
+    
+    if save:
+        try:
+            with open(save, 'w') as f:
+                f.write(key)
+            # Secure permissions
+            try:
+                os.chmod(save, 0o600)
+            except OSError:
+                pass
+            console.print(f'[green]Saved to {save}[/green]')
+        except Exception as e:
+            console.print(f'[red]Failed to save key: {e}[/red]')
+
+    if qr:
+        try:
+            import qrcode
+            qr_img = qrcode.QRCode()
+            qr_img.add_data(key)
+            qr_img.print_ascii(tty=True)
+        except ImportError:
+            console.print('[yellow]Install "qrcode" to view QR codes: pip install qrcode[/yellow]')
+
 @app.command(name='shell', help='Start HVPDB Ops Shell (HVPShell).\n\nUsage: hvpdb shell [target] [commands]')
-def hvpdb_shell(target: Optional[str]=typer.Argument(None, help='File path or URI'), commands: Optional[str]=typer.Argument(None, help='One-liner commands (sep by +)'), password: Optional[str]=typer.Option(None, help='DEPRECATED: Use passfile/env', hidden=True), passfile: Optional[str]=typer.Option(None, help='Path to file containing password')):
+def hvpdb_shell(target: Optional[str]=typer.Argument(None, help='File path or URI'), commands: Optional[str]=typer.Argument(None, help='One-liner commands (sep by +)'), password: Optional[str]=typer.Option(None, help='DEPRECATED: Use passfile/env', hidden=True), passfile: Optional[str]=typer.Option(None, help='Path to file containing password'), access_key: Optional[str]=typer.Option(None, '--access-key', help='Path to Access Key file')):
     if password:
         console.print('[bold red]SECURITY ERROR:[/bold red] Password argument/option is forbidden.')
         console.print('[yellow]Use --passfile or HVPDB_PASSWORD env var.[/yellow]')
         raise typer.Exit(code=1)
     from .hvpshell import HVPShell
+    
+    final_password = None
     if passfile:
         if not os.path.exists(passfile):
             console.print(f"[red]Passfile '{passfile}' not found.[/red]")
@@ -519,14 +710,22 @@ def hvpdb_shell(target: Optional[str]=typer.Argument(None, help='File path or UR
                 console.print(f"[red]Security Error: Passfile '{passfile}' is too open (must be 0600).[/red]")
                 raise typer.Exit(1)
         with open(passfile, 'r') as f:
-            password = f.read().strip()
+            final_password = f.read().strip()
+    elif access_key:
+        if not os.path.exists(access_key):
+            console.print(f"[red]Access Key file '{access_key}' not found.[/red]")
+            raise typer.Exit(1)
+        with open(access_key, 'r') as f:
+            final_password = f.read().strip()
+
     shell = HVPShell()
     if target:
         try:
-            if not password:
-                password = os.environ.get('HVPDB_PASSWORD')
-            if password:
-                shell.db = HVPDB(target, password)
+            if not final_password:
+                final_password = os.environ.get('HVPDB_PASSWORD')
+            
+            if final_password:
+                shell.db = HVPDB(target, final_password)
                 console.print(f'[green]Connected to {target} (Secure Injection)[/green]')
                 shell._update_prompt()
             else:
@@ -550,7 +749,6 @@ def hvpdb_backup(target: str=typer.Argument(..., help='Database Path'), output: 
     if os.path.isdir(target):
         console.print('[yellow]Cluster backup not yet supported (copy the folder manually).[/yellow]')
         return
-    import shutil
     try:
         shutil.copy2(target, output)
         console.print(f'[bold green]Backup created at {output}[/bold green]')
@@ -639,13 +837,14 @@ def hvpdb_export(target: str=typer.Argument(..., help='File path or URI'), outpu
 @app.command(name='deploy', help='Deploy HVPDB as a Network Server.\n\nUsage: hvpdb deploy <target> [port] [host]')
 def hvpdb_deploy(target: str=typer.Argument(..., help='Database Path'), port: int=typer.Argument(2321, help='Port to listen on'), host: str=typer.Argument('127.0.0.1', help='Host to bind (Default: localhost)'), password: Optional[str]=typer.Option(None, help='Database Password (Prompt if missing)')):
     from .server import start_server
-    if not password:
-        password = typer.prompt('Database Password', hide_input=True)
+    final_password = password
+    if not final_password:
+        final_password = typer.prompt('Database Password', hide_input=True)
     if not os.path.exists(target):
         console.print(f"[yellow]Database '{target}' does not exist. Initializing...[/yellow]")
-        HVPDB(target, password).storage.save()
+        HVPDB(target, final_password).storage.save()
     try:
-        start_server(target, password, host, port)
+        start_server(target, final_password, host, port)
     except KeyboardInterrupt:
         pass
     except Exception as e:
@@ -720,7 +919,7 @@ def hvpdb_help(command: Optional[str]=typer.Argument(None, help='Command to get 
 def hvpdb_show_command_help(command_name: str):
     cmd_func = None
     for cmd in app.registered_commands:
-        if cmd.name == command_name or command_name in cmd.name.split():
+        if cmd.name == command_name or (cmd.name and command_name in cmd.name.split()):
             cmd_func = cmd
             break
     if not cmd_func:

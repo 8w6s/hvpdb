@@ -1,0 +1,16 @@
+{
+  "include": [
+    "hvpdb"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "build",
+    "dist"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false
+}

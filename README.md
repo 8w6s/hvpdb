@@ -260,7 +260,9 @@ Each database lives in its own folder for clarity and isolation.
 
 - Replacing PostgreSQL at scale
 
+## ⚠️ Known Limitations
 
+- **Termux / Android**: Due to filesystem restrictions (lack of full `chmod`/`flock` support on shared storage/FUSE), you may encounter `[Errno 38] Function not implemented` or permission warnings. This is a platform limitation that cannot be fully resolved in version 1.0.2.
 
 ---
 
