@@ -13,6 +13,7 @@ from .concurrency import HVPLockManager
 from .security import HVPSecurity
 from .uri import HVPURI
 from .wal import HVPWAL
+from .utils import acquire_interruptible_lock
 
 HEADER = b'HVPDB'
 VERSION = 2
@@ -246,8 +247,8 @@ class HVPStorage:
                     f.write(kdf_bytes)
                     f.write(nonce)
                     f.write(ciphertext)
-                    f.flush()
-                    os.fsync(f.fileno())
+                    f.flush()  # Ensure data is pushed to OS buffer
+                    os.fsync(f.fileno())  # Ensure data is physically written to disk
                 finally:
                     try:
                         portalocker.unlock(f)
@@ -258,6 +259,20 @@ class HVPStorage:
                 while retries > 0:
                     try:
                         os.replace(temp_path, self.filepath)
+                        
+                        # Write Barrier: Ensure directory metadata entry is persisted
+                        # This guarantees the file replacement is atomic and durable
+                        if hasattr(os, 'open') and hasattr(os, 'fsync'):
+                            try:
+                                dir_fd = os.open(os.path.dirname(os.path.abspath(self.filepath)), os.O_RDONLY)
+                                try:
+                                    os.fsync(dir_fd)
+                                finally:
+                                    os.close(dir_fd)
+                            except (OSError, ValueError):
+                                # Directory fsync might not be supported on all platforms/filesystems
+                                pass
+                        
                         break
                     except OSError as e:
                         # Handle Termux/FUSE limitations (ENOSYS/EPERM/EXDEV)

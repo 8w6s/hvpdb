@@ -58,7 +58,9 @@ class HVPURI:
         password = None
         
         if '@' in rest:
-            auth_part, rest = rest.split('@', 1)
+            # Fix: Use rsplit to correctly handle '@' in passwords (standard URI parsing)
+            # The authority section is terminated by the last '@' before the host
+            auth_part, rest = rest.rsplit('@', 1)
             if ':' in auth_part:
                 username, password = auth_part.split(':', 1)
             else:

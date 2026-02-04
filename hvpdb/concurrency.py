@@ -38,11 +38,9 @@ class HVPLockManager:
         """
         if not os.path.exists(self.lock_path):
             try:
-                # Use secure permissions (0o600) for lock files
-                with open(self.lock_path, 'w') as f:
-                    pass
-                if os.name != 'nt':
-                    os.chmod(self.lock_path, 0o600)
+                # Fix: Use os.open to set permissions atomically
+                fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+                os.close(fd)
             except OSError as e:
                 warnings.warn(f"Failed to set lock file permissions: {e}")
         
@@ -55,7 +53,8 @@ class HVPLockManager:
             return
 
         try:
-            # Interruptible lock acquisition
+            # Interruptible lock acquisition with exponential backoff
+            delay = 0.01
             while True:
                 try:
                     portalocker.lock(f, portalocker.LOCK_SH | portalocker.LOCK_NB)
@@ -65,7 +64,8 @@ class HVPLockManager:
                     if self.is_termux:
                         break
                     # Otherwise wait and retry to emulate blocking lock but allow signals
-                    time.sleep(0.1)
+                    time.sleep(delay)
+                    delay = min(delay * 2, 0.5) # Cap at 0.5s
             yield
         finally:
             try:
@@ -84,10 +84,9 @@ class HVPLockManager:
         """
         if not os.path.exists(self.write_lock_path):
             try:
-                with open(self.write_lock_path, 'w') as f:
-                    pass
-                if os.name != 'nt':
-                    os.chmod(self.write_lock_path, 0o600)
+                # Fix: Use os.open to set permissions atomically
+                fd = os.open(self.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+                os.close(fd)
             except OSError as e:
                 warnings.warn(f"Failed to set write lock file permissions: {e}")
         
@@ -99,7 +98,8 @@ class HVPLockManager:
             return
 
         try:
-            # Interruptible lock acquisition
+            # Interruptible lock acquisition with exponential backoff
+            delay = 0.01
             while True:
                 try:
                     portalocker.lock(f, portalocker.LOCK_EX | portalocker.LOCK_NB)
@@ -107,7 +107,8 @@ class HVPLockManager:
                 except (OSError, portalocker.exceptions.LockException) as e:
                     if self.is_termux:
                         break
-                    time.sleep(0.1)
+                    time.sleep(delay)
+                    delay = min(delay * 2, 0.5)
             yield
         finally:
             try:
@@ -128,10 +129,8 @@ class HVPLockManager:
         """
         if not os.path.exists(self.lock_path):
             try:
-                with open(self.lock_path, 'w') as f:
-                    pass
-                if os.name != 'nt':
-                    os.chmod(self.lock_path, 0o600)
+                fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+                os.close(fd)
             except OSError:
                 pass
         

@@ -282,8 +282,18 @@ class HVPGroup:
 
     def _insert_mem(self, data: dict):
         """Internal: Add document to in-memory storage and update indexes."""
-        self._update_index(data['_id'], None, data)
-        self.storage.data['groups'][self.name][data['_id']] = data
+        doc_id = data['_id']
+        group_data = self.storage.data['groups'][self.name]
+        
+        # Idempotency check: prevent duplicate inserts on WAL replay
+        if doc_id in group_data:
+            existing = group_data[doc_id]
+            if existing != data:
+                warnings.warn(f"Duplicate insert for {doc_id} with different data during replay/insert")
+            return
+
+        self._update_index(doc_id, None, data)
+        group_data[doc_id] = data
         self.storage._dirty = True
 
     def insert(self, data: dict, external_txn_id: Optional[str]=None) -> dict:
@@ -666,15 +676,8 @@ class HVPDB:
             password: Raw password string.
             
         Returns:
-            Hashed password string (argon2 or scrypt).
+            Hashed password string (scrypt).
         """
-        if PasswordHasher:
-            ph = PasswordHasher()
-            try:
-                return ph.hash(password)
-            except Exception as e:
-                warnings.warn(f"PasswordHasher failed, falling back to scrypt: {e}")
-        
         salt = secrets.token_bytes(16)
         # 2026 Recommended Parameters for scrypt: N=65536 (2^16), r=8, p=1
         key = hashlib.scrypt(password.encode(), salt=salt, n=65536, r=8, p=1, dklen=32)

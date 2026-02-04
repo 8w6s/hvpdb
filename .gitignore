@@ -46,3 +46,9 @@ hvpdb-tools/
 TODO.md
 test_schema.py
 WSPCLONE.md
+tests/
+claude.txt
+claude.md
+CHANGELOG.md
+release_note.md
+WORKSPACE.md

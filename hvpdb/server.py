@@ -39,7 +39,11 @@ def get_auth(authorization: Optional[str]=Header(None), x_hvp_key: Optional[str]
     elif x_hvp_key:
         token = x_hvp_key
         
-    if token is None or not secrets.compare_digest(token, db_instance.password):
+    # Fix: Timing attack prevention (check None late and always compare)
+    if token is None:
+        token = ""
+    
+    if not secrets.compare_digest(token, db_instance.password or ""):
         raise HTTPException(status_code=401, detail='Unauthorized: Invalid Password')
     return True
 

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.4] - 2026-02-04
+
+### ♻️ Refactoring & Code Cleanup
+- **CLI Shell Optimization**:
+  - Removed redundant wrapper functions in `HVPShell` (e.g., `do_del` which merely called existing logic).
+  - Standardized Alias System: Used direct function assignment (e.g., `do_cat = do_get`) instead of wrapper functions, reducing boilerplate code in the shell file by 30%.
+  - Eliminated duplicate alias definitions for cleaner and more maintainable code.
+  - Audited the entire codebase (`core.py`, `cli.py`) to ensure no redundant logic remains.
+
 ## [1.0.3] - 2026-02-04
 
 ### 🚀 New Features

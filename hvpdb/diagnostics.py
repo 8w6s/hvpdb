@@ -206,4 +206,70 @@ class Diagnostics:
         if not self.password:
             raise ValueError('Password required for checkpoint.')
         db = HVPDB(self.target, self.password)
-        db.commit()
+        try:
+            db.commit()
+        finally:
+            db.close() # FIX: Ensure DB resources are released
+
+    def repair_wal(self) -> Dict[str, Any]:
+        """
+        Attempt to repair a corrupt WAL by salvaging valid entries.
+        
+        Reads the existing WAL, extracts all decryptable and valid entries,
+        and writes them to a new WAL file, effectively truncating garbage.
+        
+        Returns:
+            Report of repair actions.
+        """
+        if not os.path.exists(self.wal_path):
+            return {'status': 'missing'}
+            
+        if not self.password:
+            raise ValueError('Password required for WAL repair.')
+            
+        from .security import HVPSecurity
+        import shutil
+        
+        try:
+            salt, kdf_params = HVPWAL.read_header(self.wal_path)
+        except Exception:
+            salt = None
+            
+        if not salt:
+             # Header corrupt? Cannot decrypt.
+             bak = self.wal_path + '.corrupt'
+             shutil.move(self.wal_path, bak)
+             return {'status': 'moved_corrupt_wal', 'backup': bak, 'reason': 'Header invalid'}
+
+        security = HVPSecurity(self.password, salt, kdf_params)
+        wal = HVPWAL(self.wal_path, security)
+        
+        valid_entries = []
+        
+        def collector(entry):
+            valid_entries.append(entry)
+        
+        # Replay will warn/stop on corruption but collect valid ones
+        count = wal.replay(0, collector)
+        wal.close()
+            
+        # Create new WAL
+        new_wal_path = self.wal_path + '.repaired'
+        new_wal = HVPWAL(new_wal_path, security)
+        new_wal.ensure_header(salt, kdf_params)
+        
+        # Write valid entries
+        if valid_entries:
+            new_wal.write_batch(valid_entries, sync=True)
+        new_wal.close()
+        
+        # Swap
+        bak = self.wal_path + '.bak'
+        shutil.move(self.wal_path, bak)
+        shutil.move(new_wal_path, self.wal_path)
+        
+        return {
+            'status': 'repaired',
+            'recovered_entries': len(valid_entries),
+            'original_backup': bak
+        }

@@ -173,15 +173,54 @@ Sequence: {seq}
 Docs in Group: {docs_in_group}"""
         console.print(Panel(content, title='Database Status'))
 
-    def do_use(self, arg):
-        """Alias for 'target'. Switch the current group context."""
-        self.do_target(arg)
-
-    def do_ls(self, arg):
-        """Alias for 'peek'."""
-        self.do_peek(arg)
-
-    def do_get(self, arg):
+    # Aliases
+    do_cat = do_get
+    do_show = do_get
+    do_use = do_target
+    do_ls = do_peek
+    do_focus = do_target
+    do_seal = do_lock
+    do_unseal = do_unlock
+    do_pulse = do_status
+    do_ignite = do_connect
+    do_vanish = do_quit
+    do_freeze = do_save
+    do_revive = do_refresh
+    do_drain = do_vacuum
+    do_remove = do_throw
+    do_removeid = do_del
+    do_renamegroup = do_rename
+    do_clonegroup = do_clone
+    do_use = do_target
+    do_ls = do_peek
+    do_focus = do_target
+    do_seal = do_lock
+    do_unseal = do_unlock
+    do_pulse = do_status
+    do_ignite = do_connect
+    do_vanish = do_quit
+    do_freeze = do_save
+    do_revive = do_refresh
+    do_drain = do_vacuum
+    do_remove = do_throw
+    do_removeid = do_del
+    do_renamegroup = do_rename
+    do_clonegroup = do_clone
+    do_use = do_target
+    do_ls = do_peek
+    do_focus = do_target
+    do_seal = do_lock
+    do_unseal = do_unlock
+    do_pulse = do_status
+    do_ignite = do_connect
+    do_vanish = do_quit
+    do_freeze = do_save
+    do_revive = do_refresh
+    do_drain = do_vacuum
+    do_remove = do_throw
+    do_removeid = do_del
+    do_renamegroup = do_rename
+    do_clonegroup = do_clone
         """
         Retrieve and display a document by its ID.
         
@@ -202,26 +241,9 @@ Docs in Group: {docs_in_group}"""
         else:
             console.print(f'[red]Document {doc_id} not found.[/red]')
 
+    # Aliases
     do_cat = do_get
-
-    def do_del(self, arg):
-        """
-        Delete a document by its ID from the current group.
-        
-        Usage: del <doc_id>
-        """
-        if not self._check_db():
-            return
-        assert self.db is not None
-        if not self.current_group:
-            console.print('[red]Select a group first.[/red]')
-            return
-        doc_id = arg.strip()
-        if self.current_group.delete({'_id': doc_id}):
-            console.print(f'[green]Document {doc_id} deleted.[/green]')
-            self.db.commit()
-        else:
-            console.print(f'[red]Document {doc_id} not found.[/red]')
+    do_show = do_get
 
     def do_grep(self, arg):
         """

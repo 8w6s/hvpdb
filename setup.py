@@ -4,12 +4,12 @@ with open('README.md', 'r', encoding='utf-8') as fh:
 
 setup(
     name='hvpdb',
-    version='1.0.3',
+    version='1.0.4',
     description='High Velocity Python Database (NoSQL, Embedded, Encrypted)',
     long_description=long_description,
     long_description_content_type='text/markdown',
     author='HVPDB Bot',
-    author_email='bot@hvpdb.io',
+    author_email='satoharuki2321@proton.me',
     packages=find_packages(),
     install_requires=[
         'cryptography>=41.0.0',
