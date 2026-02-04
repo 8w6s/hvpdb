@@ -11,6 +11,7 @@ import portalocker
 import zstandard as zstd
 
 from .exceptions import ConsistencyError
+from .utils import default_serializer, acquire_interruptible_lock
 
 WAL_MAGIC = b'HVPWAL'
 WAL_VERSION = 2
@@ -131,7 +132,7 @@ class HVPWAL:
         """
         if self.security:
             self.ensure_header(self.security.get_salt(), self.security.get_kdf_params())
-        packed = cast(bytes, msgpack.packb(entry, use_bin_type=True))
+        packed = cast(bytes, msgpack.packb(entry, use_bin_type=True, default=default_serializer))
         compressed = self.cctx.compress(packed)
         nonce, ciphertext = self.security.encrypt_chunk(compressed)
         payload = nonce + ciphertext
@@ -168,7 +169,7 @@ class HVPWAL:
             raise RuntimeError("Failed to open WAL file")
         f = self._file_handle
         for entry in entries:
-            packed = cast(bytes, msgpack.packb(entry, use_bin_type=True))
+            packed = cast(bytes, msgpack.packb(entry, use_bin_type=True, default=default_serializer))
             compressed = self.cctx.compress(packed)
             nonce, ciphertext = self.security.encrypt_chunk(compressed)
             payload = nonce + ciphertext
@@ -358,10 +359,11 @@ class HVPWAL:
 
     def _write_header_to_handle(self, f):
         """Internal: Write the WAL header to an open file handle."""
-        try:
-            os.chmod(self.log_path, 0o600)
-        except OSError as e:
-            warnings.warn(f"Failed to set WAL file permissions: {e}")
+        if os.name != 'nt':  # Skip chmod on Windows to avoid noisy warnings
+            try:
+                os.chmod(self.log_path, 0o600)
+            except OSError as e:
+                warnings.warn(f"Failed to set WAL file permissions: {e}")
         if self.security:
             f.write(WAL_MAGIC)
             f.write(WAL_VERSION.to_bytes(2, 'big'))

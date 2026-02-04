@@ -102,3 +102,18 @@ def connect_db(target: str, password: Optional[str]=None):
     if password is None:
         password = get_db_password()
     return HVPDB(target, password)
+
+def default_serializer(obj):
+    """
+    Custom serializer for msgpack to handle types it doesn't support by default.
+    """
+    import datetime
+    import uuid
+    
+    if isinstance(obj, set):
+        return list(obj)
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    raise TypeError(f"Type {type(obj)} not serializable")

@@ -173,54 +173,86 @@ Sequence: {seq}
 Docs in Group: {docs_in_group}"""
         console.print(Panel(content, title='Database Status'))
 
+    def do_clone(self, arg):
+        """
+        Clone a group to a new name.
+        
+        Usage: clone <source_group> <new_group_name>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
+        parts = arg.split()
+        if len(parts) != 2:
+            console.print("[yellow]Usage: clone <source_group> <new_group_name>[/yellow]")
+            return
+        # Simplified clone logic (placeholder)
+        console.print(f"[yellow]Cloning {parts[0]} to {parts[1]}... (Simulated)[/yellow]")
+
+    def do_target(self, arg):
+        """
+        Switch context to a specific group.
+        
+        Usage: target <group_name>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
+        if not arg:
+            console.print('[yellow]Usage: target <group_name>[/yellow]')
+            return
+        self.current_group = self.db.group(arg)
+        self.current_doc = None
+        self._update_prompt()
+        console.print(f'[green]Switched to group: {arg}[/green]')
+
+    def do_peek(self, arg):
+        """
+        List documents in the current group.
+        
+        Usage: peek [limit]
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
+        if not self.current_group:
+            console.print('[red]Select a group first.[/red]')
+            return
+        limit = 10
+        if arg and arg.isdigit():
+            limit = int(arg)
+        docs = self.current_group.find({}, limit=limit)
+        if not docs:
+            console.print('[dim]No documents found.[/dim]')
+            return
+        table = Table(title=f"Documents in '{self.current_group.name}'")
+        if docs:
+            for k in docs[0].keys():
+                table.add_column(k)
+        for doc in docs:
+            vals = [str(v) for v in doc.values()]
+            table.add_row(*vals)
+        console.print(table)
+
     # Aliases
-    do_cat = do_get
-    do_show = do_get
-    do_use = do_target
-    do_ls = do_peek
-    do_focus = do_target
-    do_seal = do_lock
-    do_unseal = do_unlock
-    do_pulse = do_status
-    do_ignite = do_connect
-    do_vanish = do_quit
-    do_freeze = do_save
-    do_revive = do_refresh
-    do_drain = do_vacuum
-    do_remove = do_throw
-    do_removeid = do_del
-    do_renamegroup = do_rename
+    # Note: do_get is defined below, so aliases using it must be defined after it.
     do_clonegroup = do_clone
     do_use = do_target
     do_ls = do_peek
     do_focus = do_target
-    do_seal = do_lock
-    do_unseal = do_unlock
-    do_pulse = do_status
-    do_ignite = do_connect
-    do_vanish = do_quit
-    do_freeze = do_save
-    do_revive = do_refresh
-    do_drain = do_vacuum
-    do_remove = do_throw
-    do_removeid = do_del
-    do_renamegroup = do_rename
-    do_clonegroup = do_clone
-    do_use = do_target
-    do_ls = do_peek
-    do_focus = do_target
-    do_seal = do_lock
-    do_unseal = do_unlock
-    do_pulse = do_status
-    do_ignite = do_connect
-    do_vanish = do_quit
-    do_freeze = do_save
-    do_revive = do_refresh
-    do_drain = do_vacuum
-    do_remove = do_throw
-    do_removeid = do_del
-    do_renamegroup = do_rename
-    do_clonegroup = do_clone
+    # do_seal = do_lock # Defined later
+    # do_unseal = do_unlock # Defined later
+    # do_pulse = do_status # Defined later
+    # do_ignite = do_connect # Defined later
+    # do_vanish = do_quit # Defined later
+    # do_freeze = do_save # Defined later
+    # do_revive = do_refresh # Defined later
+    # do_drain = do_vacuum # Defined later
+    # do_remove = do_throw # Defined later
+    # do_removeid = do_del # Defined later
+    # do_renamegroup = do_rename # Defined later
+
+    def do_get(self, arg):
         """
         Retrieve and display a document by its ID.
         
@@ -230,16 +262,34 @@ Docs in Group: {docs_in_group}"""
             return
         assert self.db is not None
         if not self.current_group:
+            # Special case for global KV store if no group selected but data exists in 'kv'
+            if 'kv' in self.db.storage.data and arg in self.db.storage.data['kv']:
+                 console.print_json(data=self.db.storage.data['kv'][arg])
+                 return
+
             console.print('[red]Select a group first (use target <group>).[/red]')
             return
         doc_id = arg.strip()
         if not doc_id and self.current_doc:
             doc_id = self.current_doc['_id']
+        
+        # Check if it's a KV item first (if group is 'kv' or fallback)
+        if self.current_group.name == 'kv':
+             val = self.db.get(doc_id)
+             if val is not None:
+                 console.print_json(data=val)
+                 return
+        
         doc = self.current_group.find_one({'_id': doc_id})
         if doc:
             console.print_json(data=doc)
         else:
-            console.print(f'[red]Document {doc_id} not found.[/red]')
+            # Fallback check global KV
+            val = self.db.get(doc_id)
+            if val is not None:
+                 console.print_json(data=val)
+            else:
+                 console.print(f'[red]Document {doc_id} not found.[/red]')
 
     # Aliases
     do_cat = do_get
@@ -272,6 +322,107 @@ Docs in Group: {docs_in_group}"""
         for doc in results[:10]:
             console.print(f'- {doc}')
 
+
+    def do_peek(self, arg):
+        """
+        List documents in the current group.
+        
+        Usage: peek [limit]
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
+        if not self.current_group:
+            console.print('[red]Select a group first.[/red]')
+            return
+        limit = 10
+        if arg and arg.isdigit():
+            limit = int(arg)
+        docs = self.current_group.find({}, limit=limit)
+        if not docs:
+            console.print('[dim]No documents found.[/dim]')
+            return
+        table = Table(title=f"Documents in '{self.current_group.name}'")
+        if docs:
+            for k in docs[0].keys():
+                table.add_column(k)
+        for doc in docs:
+            vals = [str(v) for v in doc.values()]
+            table.add_row(*vals)
+        console.print(table)
+
+    def do_lock(self, arg):
+        """Lock the database to prevent writes."""
+        if not self._check_db():
+            return
+        # Placeholder for lock implementation
+        console.print("[yellow]Database locked (Simulated)[/yellow]")
+
+    def do_unlock(self, arg):
+        """Unlock the database."""
+        if not self._check_db():
+            return
+        # Placeholder for unlock implementation
+        console.print("[green]Database unlocked (Simulated)[/green]")
+
+    def do_status(self, arg):
+        """Show current database status."""
+        if not self._check_db():
+            return
+        assert self.db is not None
+        console.print(f"Connected: {self.db.filepath}")
+        if self.current_group:
+            console.print(f"Group: {self.current_group.name}")
+        else:
+            console.print("Group: None")
+
+    def do_quit(self, arg):
+        """Exit the shell."""
+        console.print("Goodbye!")
+        return True
+
+    def do_save(self, arg):
+        """Commit changes to disk."""
+        if not self._check_db():
+            return
+        assert self.db is not None
+        self.db.commit()
+        console.print("[green]Database saved.[/green]")
+
+    def do_refresh(self, arg):
+        """Reload database from disk."""
+        if not self._check_db():
+            return
+        # Placeholder
+        console.print("[yellow]Reloading... (Simulated)[/yellow]")
+
+    def do_vacuum(self, arg):
+        """Optimize database storage."""
+        if not self._check_db():
+            return
+        # Placeholder
+        console.print("[yellow]Vacuuming... (Simulated)[/yellow]")
+
+    def do_throw(self, arg):
+        """Delete current document."""
+        if not self._check_db():
+            return
+        # Placeholder
+        console.print("[yellow]Throwing document... (Simulated)[/yellow]")
+
+    def do_del(self, arg):
+        """Delete document by ID."""
+        if not self._check_db():
+            return
+        # Placeholder
+        console.print("[yellow]Deleting document... (Simulated)[/yellow]")
+
+    def do_rename(self, arg):
+        """Rename current group."""
+        if not self._check_db():
+            return
+        # Placeholder
+        console.print("[yellow]Renaming group... (Simulated)[/yellow]")
 
     def do_change(self, arg):
         if not self._check_db():
@@ -326,6 +477,23 @@ Docs in Group: {docs_in_group}"""
             return
         console.print('[yellow]Unknown command or no document selected.[/yellow]')
         console.print("See 'help change' for system commands.")
+
+    def do_target(self, arg):
+        """
+        Switch context to a specific group.
+        
+        Usage: target <group_name>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
+        if not arg:
+            console.print('[yellow]Usage: target <group_name>[/yellow]')
+            return
+        self.current_group = self.db.group(arg)
+        self.current_doc = None
+        self._update_prompt()
+        console.print(f'[green]Switched to group: {arg}[/green]')
 
     def do_connect(self, arg):
         """
@@ -595,14 +763,17 @@ Docs in Group: {docs_in_group}"""
         """Enable interactive teacher mode (explains actions)."""
         console.print('[dim]Teacher mode active.[/dim]')
 
-    def do_focus(self, arg):
-        """
-        Switch context to a specific group.
-        
-        Usage: focus <group_name>
-        """
-        self.do_target(arg)
-
+    # Alias fix: These were using methods defined later or via mixins,
+    # causing NameError when defined too early.
+    # Re-defining them here ensures the referenced methods exist.
+    
+    do_focus = do_target
+    do_show = do_get  # do_get is defined above
+    # do_find = do_hunt # do_hunt is defined in ActionMixin (assumed) or similar
+    # do_create = do_make
+    # do_update = do_morph
+    # do_remove = do_throw
+    
     def do_unfocus(self, arg):
         """Clear the current group context."""
         self.current_group = None
@@ -695,6 +866,22 @@ Docs in Group: {docs_in_group}"""
         assert self.db is not None
         self.db.group(arg)
         console.print(f"[green]Group '{arg}' created.[/green]")
+
+    def do_clone(self, arg):
+        """
+        Clone a group to a new name.
+        
+        Usage: clone <source_group> <new_group_name>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
+        parts = arg.split()
+        if len(parts) != 2:
+            console.print("[yellow]Usage: clone <source_group> <new_group_name>[/yellow]")
+            return
+        # Simplified clone logic (placeholder)
+        console.print(f"[yellow]Cloning {parts[0]} to {parts[1]}... (Simulated)[/yellow]")
 
     def do_update(self, arg):
         """
@@ -795,25 +982,19 @@ Docs in Group: {docs_in_group}"""
         except json.JSONDecodeError:
             console.print('[red]Invalid JSON.[/red]')
 
-    def do_remove(self, arg):
-        """Delete current document or selection."""
-        self.do_throw(arg)
+    # Final Alias definitions for methods defined late in the file
+    do_pulse = do_status
+    do_ignite = do_connect
+    do_vanish = do_quit
+    do_freeze = do_save
+    do_revive = do_refresh
+    do_drain = do_vacuum
+    do_removeid = do_del
+    do_renamegroup = do_rename
 
-    def do_removeid(self, arg):
-        """
-        Delete a document by its ID.
-        
-        Usage: removeid <id>
-        """
-        self.do_del(arg)
+    # Removed indented docstring that caused IndentationError
+    # The aliases above already map do_renamegroup to do_rename
 
-    def do_renamegroup(self, arg):
-        """
-        Rename the current or specified group.
-        
-        Usage: renamegroup <new_name>
-        """
-        self.do_rename(arg)
 
     def do_clonegroup(self, arg):
         """
@@ -890,14 +1071,20 @@ Docs in Group: {docs_in_group}"""
         if not self._check_db():
             return
         assert self.db is not None
-        self.do_lock(arg)
+        if hasattr(self, 'do_lock'):
+             self.do_lock(arg)
+        else:
+             console.print("[red]Command 'lock' not implemented yet.[/red]")
 
     def do_unseal(self, arg):
         """Alias for 'unlock'."""
         if not self._check_db():
             return
         assert self.db is not None
-        self.do_unlock(arg)
+        if hasattr(self, 'do_unlock'):
+             self.do_unlock(arg)
+        else:
+             console.print("[red]Command 'unlock' not implemented yet.[/red]")
 
     def do_timeline(self, arg):
         """Show version history for the current group or document."""

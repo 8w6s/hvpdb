@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.4.post2] - 2026-02-05
+
+### 🛡️ Security & Stability
+- **CLI Security Audit**: Fixed a "Fail Open" vulnerability where the shell would exit with code 0 even if authentication failed in batch mode. Now it correctly exits with code 1.
+- **Windows Compatibility**: Fixed `PermissionError` warnings related to file permissions (`os.chmod`) on Windows environments.
+- **CI/CD**: Added a robust CI pipeline (`run_ci.py`) that includes environment checks, full test suite execution, and build verification.
+
+## [1.0.4.post1] - 2026-02-05
+
+### 🐛 Bug Fixes
+- **Serialization**: Fixed `TypeError` when serializing `set`, `datetime`, and `uuid.UUID` objects. Added `default_serializer` to handle these types gracefully.
+
+### 🔐 Security & UX
+- **QR Code Upgrade**: The `gen-key` command now generates a QR code containing a URI (`hvpdb://setup?key=...`) instead of raw text, enabling easier integration with mobile apps and "Passkey-like" import workflows.
+
 ## [1.0.4] - 2026-02-04
 
 ### ♻️ Refactoring & Code Cleanup

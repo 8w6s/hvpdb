@@ -13,7 +13,7 @@ from .concurrency import HVPLockManager
 from .security import HVPSecurity
 from .uri import HVPURI
 from .wal import HVPWAL
-from .utils import acquire_interruptible_lock
+from .utils import acquire_interruptible_lock, default_serializer
 
 HEADER = b'HVPDB'
 VERSION = 2
@@ -214,7 +214,7 @@ class HVPStorage:
             if self.security is None:
                 raise RuntimeError("Security context not initialized")
             self.data['seq'] = self._last_sequence
-            packed_data = cast(bytes, msgpack.packb(self.data, use_bin_type=True))
+            packed_data = cast(bytes, msgpack.packb(self.data, use_bin_type=True, default=default_serializer))
             compressed_data = self.cctx.compress(packed_data)
             salt = self.security.get_salt()
             kdf_params = self.security.get_kdf_params()

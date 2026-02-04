@@ -686,8 +686,11 @@ def hvpdb_gen_key(
         try:
             import qrcode
             qr_img = qrcode.QRCode()
-            qr_img.add_data(key)
+            # Generate a URI for easier mobile integration (Passkey-like experience)
+            uri = f"hvpdb://setup?key={key}&type=access_key"
+            qr_img.add_data(uri)
             qr_img.print_ascii(tty=True)
+            console.print(f"[dim]QR URI: {uri}[/dim]")
         except ImportError:
             console.print('[yellow]Install "qrcode" to view QR codes: pip install qrcode[/yellow]')
 
@@ -732,6 +735,8 @@ def hvpdb_shell(target: Optional[str]=typer.Argument(None, help='File path or UR
                 shell.onecmd(f'connect {target}')
         except Exception as e:
             console.print(f'[red]Auto-connect failed: {e}[/red]')
+            if commands: # If running in batch mode, fail fast
+                raise typer.Exit(1)
     if commands:
         cmds = commands.split('+')
         for cmd in cmds:
