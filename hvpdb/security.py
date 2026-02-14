@@ -24,18 +24,23 @@ class HVPSecurity:
         """
         self._password = password.encode('utf-8')
         self.salt = salt if salt else os.urandom(16)
-        self.kdf_params = kdf_params if kdf_params else {'time_cost': 4, 'memory_cost': 102400, 'parallelism': 4}
+        self.kdf_params = kdf_params if kdf_params else {'time_cost': 4, 'memory_cost': 262144, 'parallelism': 4, 'auth_type': 'password'}
+        # Ensure auth_type defaults to 'password' if missing in provided params
+        if 'auth_type' not in self.kdf_params:
+            self.kdf_params['auth_type'] = 'password'
+            
         self._key = self._derive_key()
         
         # Clear password from memory immediately after derivation
         self._password = None
 
-    def rotate_key(self, new_password: str) -> bool:
+    def rotate_key(self, new_password: str, auth_type: str = 'password') -> bool:
         """
-        Update the security context with a new password.
+        Update the security context with a new password and optional auth type.
         
         Args:
             new_password: The new password to use.
+            auth_type: The authentication type ('password', 'access_key', 'passkey').
             
         Returns:
             True if rotation succeeded.
@@ -43,6 +48,7 @@ class HVPSecurity:
         try:
             self._password = new_password.encode('utf-8')
             self.salt = os.urandom(16)
+            self.kdf_params['auth_type'] = auth_type
             self._key = self._derive_key()
             self._password = None
             return True

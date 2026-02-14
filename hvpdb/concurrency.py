@@ -36,21 +36,12 @@ class HVPLockManager:
         Yields:
             None
         """
-        if not os.path.exists(self.lock_path):
-            try:
-                # Fix: Use os.open to set permissions atomically
-                fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-                os.close(fd)
-            except OSError as e:
-                warnings.warn(f"Failed to set lock file permissions: {e}")
-        
         try:
-            f = open(self.lock_path, 'r+')
+             fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+             f = os.fdopen(fd, 'r+')
         except OSError as e:
-            warnings.warn(f"Failed to open lock file: {e}")
-            # Fallback for read-only filesystems
-            yield
-            return
+             # Fail fast if we can't even open the lock file
+             raise RuntimeError(f"Failed to open lock file {self.lock_path}: {e}")
 
         try:
             # Interruptible lock acquisition with exponential backoff
@@ -62,6 +53,7 @@ class HVPLockManager:
                 except (OSError, portalocker.exceptions.LockException) as e:
                     # If locking is not supported (e.g. Termux), fail fast
                     if self.is_termux:
+                        warnings.warn(f"Locking not supported on this platform: {e}")
                         break
                     # Otherwise wait and retry to emulate blocking lock but allow signals
                     time.sleep(delay)
@@ -82,20 +74,12 @@ class HVPLockManager:
         Yields:
             None
         """
-        if not os.path.exists(self.write_lock_path):
-            try:
-                # Fix: Use os.open to set permissions atomically
-                fd = os.open(self.write_lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-                os.close(fd)
-            except OSError as e:
-                warnings.warn(f"Failed to set write lock file permissions: {e}")
-        
+        print(f"[LOCK DEBUG] Acquiring writer lock on {self.write_lock_path}...")
         try:
-            f = open(self.write_lock_path, 'r+')
+             fd = os.open(self.write_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+             f = os.fdopen(fd, 'r+')
         except OSError as e:
-            warnings.warn(f"Failed to open write lock file: {e}")
-            yield
-            return
+             raise RuntimeError(f"Failed to open write lock file {self.write_lock_path}: {e}")
 
         try:
             # Interruptible lock acquisition with exponential backoff
@@ -103,6 +87,7 @@ class HVPLockManager:
             while True:
                 try:
                     portalocker.lock(f, portalocker.LOCK_EX | portalocker.LOCK_NB)
+                    print(f"[LOCK DEBUG] Acquired writer lock.")
                     break
                 except (OSError, portalocker.exceptions.LockException) as e:
                     if self.is_termux:
@@ -111,11 +96,13 @@ class HVPLockManager:
                     delay = min(delay * 2, 0.5)
             yield
         finally:
+            print(f"[LOCK DEBUG] Releasing writer lock...")
             try:
                 portalocker.unlock(f)
             except (OSError, portalocker.exceptions.LockException) as e:
                 warnings.warn(f"Failed to unlock: {e}")
             f.close()
+            print(f"[LOCK DEBUG] Released writer lock.")
 
     @contextmanager
     def critical_swap_lock(self):
@@ -127,12 +114,11 @@ class HVPLockManager:
         Yields:
             None
         """
-        if not os.path.exists(self.lock_path):
-            try:
-                fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-                os.close(fd)
-            except OSError:
-                pass
+        try:
+            fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            os.close(fd)
+        except OSError:
+            pass
         
         try:
             f = open(self.lock_path, 'r+')

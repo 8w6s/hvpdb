@@ -247,10 +247,8 @@ Docs in Group: {docs_in_group}"""
     # do_vanish = do_quit # Defined later
     # do_freeze = do_save # Defined later
     # do_revive = do_refresh # Defined later
-    # do_drain = do_vacuum # Defined later
-    # do_remove = do_throw # Defined later
-    # do_removeid = do_del # Defined later
-    # do_renamegroup = do_rename # Defined later
+    # Alias placeholders
+
 
     def do_get(self, arg):
         """
@@ -351,78 +349,7 @@ Docs in Group: {docs_in_group}"""
             table.add_row(*vals)
         console.print(table)
 
-    def do_lock(self, arg):
-        """Lock the database to prevent writes."""
-        if not self._check_db():
-            return
-        # Placeholder for lock implementation
-        console.print("[yellow]Database locked (Simulated)[/yellow]")
-
-    def do_unlock(self, arg):
-        """Unlock the database."""
-        if not self._check_db():
-            return
-        # Placeholder for unlock implementation
-        console.print("[green]Database unlocked (Simulated)[/green]")
-
-    def do_status(self, arg):
-        """Show current database status."""
-        if not self._check_db():
-            return
-        assert self.db is not None
-        console.print(f"Connected: {self.db.filepath}")
-        if self.current_group:
-            console.print(f"Group: {self.current_group.name}")
-        else:
-            console.print("Group: None")
-
-    def do_quit(self, arg):
-        """Exit the shell."""
-        console.print("Goodbye!")
-        return True
-
-    def do_save(self, arg):
-        """Commit changes to disk."""
-        if not self._check_db():
-            return
-        assert self.db is not None
-        self.db.commit()
-        console.print("[green]Database saved.[/green]")
-
-    def do_refresh(self, arg):
-        """Reload database from disk."""
-        if not self._check_db():
-            return
-        # Placeholder
-        console.print("[yellow]Reloading... (Simulated)[/yellow]")
-
-    def do_vacuum(self, arg):
-        """Optimize database storage."""
-        if not self._check_db():
-            return
-        # Placeholder
-        console.print("[yellow]Vacuuming... (Simulated)[/yellow]")
-
-    def do_throw(self, arg):
-        """Delete current document."""
-        if not self._check_db():
-            return
-        # Placeholder
-        console.print("[yellow]Throwing document... (Simulated)[/yellow]")
-
-    def do_del(self, arg):
-        """Delete document by ID."""
-        if not self._check_db():
-            return
-        # Placeholder
-        console.print("[yellow]Deleting document... (Simulated)[/yellow]")
-
-    def do_rename(self, arg):
-        """Rename current group."""
-        if not self._check_db():
-            return
-        # Placeholder
-        console.print("[yellow]Renaming group... (Simulated)[/yellow]")
+    # Old placeholders removed to avoid duplication
 
     def do_change(self, arg):
         if not self._check_db():
@@ -557,6 +484,48 @@ Docs in Group: {docs_in_group}"""
                 pass
         except Exception as e:
             console.print(f'[red]Refresh failed: {e}[/red]')
+
+    def do_del(self, arg):
+        """
+        Delete a document by ID.
+        
+        Usage: del <doc_id>
+        """
+        if not self._check_db():
+            return
+        assert self.db is not None
+        if not self.current_group:
+            # Check KV
+            if 'kv' in self.db.storage.data and arg in self.db.storage.data['kv']:
+                del self.db.storage.data['kv'][arg]
+                self.db.storage._dirty = True
+                self.db.commit()
+                console.print(f'[green]Key {arg} deleted from KV.[/green]')
+                return
+            console.print('[red]Select a group first.[/red]')
+            return
+        
+        doc_id = arg.strip()
+        if not doc_id and self.current_doc:
+            doc_id = self.current_doc['_id']
+            
+        if not doc_id:
+            console.print('[yellow]Usage: del <doc_id>[/yellow]')
+            return
+            
+        if self.current_group.name == 'kv':
+            self.db.delete_key(doc_id)
+            console.print(f'[green]Key {doc_id} deleted.[/green]')
+            return
+            
+        res = self.current_group.delete({'_id': doc_id})
+        if res > 0:
+            console.print(f'[green]Document {doc_id} deleted.[/green]')
+            if self.current_doc and self.current_doc.get('_id') == doc_id:
+                self.current_doc = None
+                self._update_prompt()
+        else:
+            console.print(f'[yellow]Document {doc_id} not found.[/yellow]')
 
     def do_set(self, arg):
         """
@@ -982,18 +951,9 @@ Docs in Group: {docs_in_group}"""
         except json.JSONDecodeError:
             console.print('[red]Invalid JSON.[/red]')
 
-    # Final Alias definitions for methods defined late in the file
-    do_pulse = do_status
-    do_ignite = do_connect
-    do_vanish = do_quit
-    do_freeze = do_save
-    do_revive = do_refresh
-    do_drain = do_vacuum
-    do_removeid = do_del
-    do_renamegroup = do_rename
+    # Alias definitions moved/removed to avoid NameError due to forward referencing
+    # (Methods must be defined before aliasing if assigned directly)
 
-    # Removed indented docstring that caused IndentationError
-    # The aliases above already map do_renamegroup to do_rename
 
 
     def do_clonegroup(self, arg):
@@ -1987,20 +1947,37 @@ Docs in Group: {docs_in_group}"""
             return '******'
 
     def _update_prompt(self):
+        # ANSI Escape Codes for CLI styling (cmd.Cmd doesn't support Rich markup in prompt)
+        RESET = '\033[0m'
+        BOLD = '\033[1m'
+        DIM = '\033[2m'
+        RED = '\033[31m'
+        GREEN = '\033[32m'
+        YELLOW = '\033[33m'
+        BLUE = '\033[34m'
+        MAGENTA = '\033[35m'
+        CYAN = '\033[36m'
+        WHITE = '\033[37m'
+
         if not self.db:
-            self.prompt = '[bold red]hvpdb (disconnected)[/bold red] > '
+            self.prompt = f'{BOLD}{RED}hvpdb (disconnected){RESET} > '
             return
+        
         conn_info = self._mask_uri(self.db.filepath)
-        prompt_parts = [f'[bold cyan]hvpdb[/bold cyan] [[dim white]{conn_info}[/dim white]]']
+        # Using Cyan for app name, Dim White for connection info
+        prompt_parts = [f'{BOLD}{CYAN}hvpdb{RESET} [{DIM}{WHITE}{conn_info}{RESET}]']
+        
         if self.current_group:
-            prompt_parts.append(f'[[yellow]{self.current_group.name}[/yellow]]')
+            prompt_parts.append(f'[{YELLOW}{self.current_group.name}{RESET}]')
             if self.selected_docs:
-                prompt_parts.append(f'[[blue]SEL:{len(self.selected_docs)}[/blue]]')
+                prompt_parts.append(f'[{BLUE}SEL:{len(self.selected_docs)}{RESET}]')
             if self.current_doc:
-                doc_id = self.current_doc.get('_id', 'unknown')[:6]
-                prompt_parts.append(f'[[magenta]{doc_id}[/magenta]]')
+                doc_id = str(self.current_doc.get('_id', 'unknown'))[:6]
+                prompt_parts.append(f'[{MAGENTA}{doc_id}{RESET}]')
+        
         if self.is_locked:
-            prompt_parts.append('[bold red][LOCKED][/bold red]')
+            prompt_parts.append(f'{BOLD}{RED}[LOCKED]{RESET}')
+            
         self.prompt = ' '.join(prompt_parts) + ' > '
 
     def do_lock(self, arg):
@@ -2142,6 +2119,9 @@ Docs in Group: {docs_in_group}"""
             remaining = total_docs - limit
             console.print(f"[dim]... and {remaining} more documents. Use 'peek {limit + 20}' or 'peek full' to see more.[/dim]")
 
+    # Alias definitions must come AFTER the methods they reference
+    do_ls = do_peek
+    
     def do_hunt(self, arg):
         """
         Search for documents matching key=value pairs or regex patterns.
@@ -3102,20 +3082,31 @@ Docs in Group: {docs_in_group}"""
         interval = 2
         if arg and arg.isdigit():
             interval = int(arg)
-        console.print('[cyan]Monitoring... (Ctrl+C to stop)[/cyan]')
+            
+        console.print(f'[bold]Monitoring {os.path.basename(self.db.filepath)} every {interval}s... (Ctrl+C to stop)[/bold]')
         try:
-            with console.status('Monitoring DB Activity...') as status:
-                while True:
-                    total_docs = 0
-                    groups = self.db.get_all_groups()
-                    for g in groups:
-                        total_docs += self.db.group(g).count()
-                    size_mb = os.path.getsize(self.db.filepath) / (1024 * 1024) if os.path.exists(self.db.filepath) else 0
-                    status.update(f'Groups: {len(groups)} | Docs: {total_docs} | Size: {size_mb:.2f} MB')
-                    time.sleep(interval)
+            while True:
+                # Simple stat check
+                stats = []
+                stats.append(f"Size: {os.path.getsize(self.db.filepath)} bytes")
+                if hasattr(self.db.storage, 'data'):
+                    g_count = len(self.db.storage.data.get('groups', {}))
+                    stats.append(f"Groups: {g_count}")
+                console.print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] " + " | ".join(stats))
+                time.sleep(interval)
         except KeyboardInterrupt:
-            console.print('\n[dim]Monitor stopped.[/dim]')
+            console.print('\n[dim]Monitoring stopped.[/dim]')
 
+    # Alias definitions must come AFTER the methods they reference
+    do_pulse = do_status
+    do_ignite = do_connect
+    do_vanish = do_quit
+    do_freeze = do_save
+    do_revive = do_refresh
+    do_drain = do_vacuum
+    do_removeid = do_del # Now it works because do_del is defined
+    do_renamegroup = do_rename
+    
     def do_record(self, arg):
         """
         Manage and interact with the Write-Ahead Log (WAL) records.
@@ -3408,3 +3399,63 @@ Docs in Group: {docs_in_group}"""
             return
 
         self.do_help('record')
+
+    def do_passkey(self, arg):
+        """
+        Manage Passkey authentication.
+        
+        Usage: 
+          passkey register [username]
+          passkey list [username]
+        """
+        args = arg.split()
+        if not args:
+            console.print("[yellow]Usage: passkey <register|list> [username][/yellow]")
+            return
+            
+        cmd = args[0].lower()
+        username = args[1] if len(args) > 1 else 'admin'
+        
+        try:
+            from .passkey_store import PasskeyStore
+            store = PasskeyStore()
+        except ImportError:
+            console.print("[red]Passkey support not available (missing dependencies).[/red]")
+            return
+        
+        if cmd == 'register':
+            console.print(f"[cyan]Registering Passkey for user '{username}'...[/cyan]")
+            # 1. Ask for current DB password to store securely
+            password = console.input("Enter current DB password to link (will be hidden): ", password=True)
+            if not password:
+                console.print("[red]Password required to link Passkey.[/red]")
+                return
+            
+            # 2. Perform WebAuthn Registration (Native if Windows, else Simulation/HID)
+            try:
+                from .passkey_auth import register_passkey
+                if register_passkey(username, store, password):
+                    console.print(f"[green]Passkey registered successfully for user '{username}'![/green]")
+                    console.print("[dim]You can now use 'hvpdb shell --passkey' to login.[/dim]")
+                else:
+                    console.print("[red]Passkey registration failed.[/red]")
+            except ImportError:
+                 console.print("[red]Passkey authentication module missing.[/red]")
+
+        elif cmd == 'list':
+            pks = store.get_passkeys(username)
+            if not pks:
+                console.print(f"[yellow]No passkeys found for {username}.[/yellow]")
+                return
+            table = Table(title=f"Passkeys for {username}")
+            table.add_column("Credential ID (Truncated)", style="cyan")
+            table.add_column("Sign Count", style="green")
+            table.add_column("Linked Secret", style="red")
+            
+            for pk in pks:
+                cid = pk.get('credential_id', '')[:20] + '...'
+                has_secret = 'Yes' if pk.get('secret') else 'No'
+                table.add_row(cid, str(pk.get('sign_count')), has_secret)
+            console.print(table)
+        else:
+            console.print(f"[red]Unknown subcommand: {cmd}[/red]")

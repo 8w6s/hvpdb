@@ -2,6 +2,7 @@ import datetime
 import difflib
 import json
 import os
+import platform
 import shutil
 import sys
 import warnings
@@ -648,12 +649,257 @@ def hvpdb_passwd(target: str=typer.Argument(..., help='File path or URI'), passw
     if not new_pass:
         console.print('[red]Password cannot be empty![/red]')
         raise typer.Exit(1)
-    db.storage.password = new_pass
-    db.storage._dirty = True
-    db.storage.security = None
-    console.print('[yellow]Re-encrypting database...[/yellow]')
-    db.commit()
+    
+    db.change_password(new_pass)
     console.print('[bold green]Password changed successfully![/bold green]')
+
+@app.command(name='config', help='Configure database settings (Auth Type, etc).')
+def hvpdb_config(
+    target: str = typer.Argument(..., help='Database Path'),
+    auth_type: str = typer.Option(None, '--auth-type', help='Set Authentication Type (password, access_key, passkey)'),
+    password: Optional[str] = typer.Option(None, help='Current Password')
+):
+    """Update database configuration and metadata."""
+    db = hvpdb_get_db(target, password)
+    
+    changes = False
+    
+    if auth_type:
+        if auth_type not in ['password', 'access_key', 'passkey']:
+            console.print(f"[red]Invalid auth type: {auth_type}. Must be one of: password, access_key, passkey[/red]")
+            raise typer.Exit(1)
+            
+        # To update auth_type, we need to re-save the header.
+        # We can reuse change_password logic but keep the same password.
+        console.print(f"[yellow]Updating Auth Type to '{auth_type}'...[/yellow]")
+        db.change_password(db.password, auth_type=auth_type)
+        changes = True
+        
+    if not changes:
+        # Just show current config
+        console.print(Panel(f"Target: {target}", title="Database Configuration"))
+        if db.storage and db.storage.security:
+            params = db.storage.security.get_kdf_params()
+            console.print(f"Auth Type: [cyan]{params.get('auth_type', 'password')}[/cyan]")
+            console.print(f"KDF: Argon2 (m={params.get('memory_cost')}, t={params.get('time_cost')}, p={params.get('parallelism')})")
+        else:
+            console.print("[red]Could not read security parameters.[/red]")
+    else:
+        console.print("[bold green]Configuration updated successfully.[/bold green]")
+
+@app.command(name='gen-passkey', help='Generate QR for Passkey Creation or use Native Windows Hello.')
+def hvpdb_gen_passkey(
+    user: str = typer.Argument(..., help='Username/Email for Passkey'),
+    native: Optional[bool] = typer.Option(None, '--native', help='Use native Windows Hello (Auto-detects OS if omitted)'),
+    host: str = typer.Option('0.0.0.0', help='Bind Host (for QR mode)'),
+    port: int = typer.Option(8000, help='Bind Port (for QR mode)')
+):
+    """
+    Create a Passkey credential.
+    
+    Modes:
+    1. Native (Windows): Pops up Windows Hello dialog.
+    2. Remote (Linux/Mac): Shows QR code for mobile device.
+    """
+    current_os = platform.system()
+    if native is None:
+        native = (current_os == 'Windows')
+        mode_str = "Native (Windows Hello)" if native else "QR Code (Mobile)"
+        console.print(f"[dim]Auto-detected OS: {current_os}. Using {mode_str} mode.[/dim]")
+    
+    if native:
+        # Try to add user site-packages to path explicitly if missing
+        import site
+        import sys
+        # Standard user site
+        user_site = site.getusersitepackages()
+        if user_site not in sys.path:
+            sys.path.append(user_site)
+            
+        # Also try to force the specific path we found in the environment if standard one fails
+        # This is a fallback for weird environments where site.getusersitepackages() is wrong
+        fallback_site = os.path.expandvars(r'%APPDATA%\Python\Python314\site-packages')
+        if os.path.exists(fallback_site) and fallback_site not in sys.path:
+            sys.path.append(fallback_site)
+        
+        try:
+            import fido2
+        except ImportError:
+             # Try one last resort: dynamic import using runpy to execute a check script
+             # This bypasses some weird import caching issues
+             try:
+                 import importlib.util
+                 spec = importlib.util.find_spec("fido2")
+                 if spec:
+                     fido2 = importlib.util.module_from_spec(spec)
+                     spec.loader.exec_module(fido2)
+                 else:
+                     raise ImportError
+             except Exception:
+                 console.print(f'[red]Error: "fido2" library is required for native mode.[/red]')
+                 console.print(f'[dim]Debug: sys.path checked: {sys.path}[/dim]')
+                 console.print('Install with: [green]pip install fido2[/green]')
+                 raise typer.Exit(1)
+            
+        from .fido_native import create_passkey_windows
+        from .passkey_store import PasskeyStore
+        
+        result = create_passkey_windows(user)
+        
+        if result:
+             # Extract credential ID and Public Key
+             try:
+                 if hasattr(result, 'attestation_object'):
+                     att_obj = result.attestation_object
+                 else:
+                     att_obj = result.response.attestation_object
+                 
+                 cred_id = att_obj.auth_data.credential_data.credential_id
+                 # att_obj is bytes or AttestationObject. 
+                 # We need the raw bytes of attestation object or public key.
+                 # fido2 AttestationObject holds the entire structure.
+                 
+                 # To get the public key in a storable format, we can store the whole attestation object 
+                 # or just the COSE key. For this simple store, we'll store the raw attestation object bytes
+                 # (which contains the public key) if possible, or just the credential ID if we trust the OS.
+                 # But verify needs public key.
+                 
+                 # result.attestation_object is of type AttestationObject (fido2 library class)
+                 # We can just serialize what we can.
+                  
+                 # For simplicity, we store the credential ID and sign count. 
+                 # Verification without public key is "trusting the authenticator".
+                 # But let's try to grab the public key bytes if we can.
+                  
+                 # In fido2 lib, att_obj is the parsed object.
+                 # To verify signature later, we really need the public key.
+                 # att_obj.auth_data.credential_data.public_key is the COSE key (bytes).
+                  
+                 # att_obj.auth_data.credential_data.public_key is the COSE key (bytes).
+                 
+                 # In fido2 >= 1.0, public_key might be a CoseKey object which wraps a dict
+                 pk = att_obj.auth_data.credential_data.public_key
+                 if hasattr(pk, 'items'): # Dictionary-like (CoseKey)
+                     # Convert CoseKey to bytes using CBOR encoding if needed, or just repr for now
+                     # Actually fido2 utils has _as_cbor or similar.
+                     # Let's try to just use websafe_encode on the raw bytes if available, or just skip encoding if it fails
+                     # If it's a CoseKey, we can encode it back to bytes using fido2.cbor
+                     try:
+                         from fido2 import cbor
+                         public_key = cbor.encode(pk)
+                     except ImportError:
+                          # Fallback if cbor not available at top level (it moved in v1)
+                          from fido2.utils import sha256 # dummy import
+                          # In newer fido2, cbor is in fido2.cbor
+                          import fido2.cbor
+                          public_key = fido2.cbor.encode(pk)
+                 else:
+                     public_key = pk
+                 
+                 # Counter is in auth_data, not in result.response (which is AuthenticatorAttestationResponse)
+                 # att_obj (AttestationObject) has auth_data (AuthenticatorData) which has counter
+                 counter = att_obj.auth_data.counter
+                 
+                 store = PasskeyStore()
+                 store.add_passkey(user, cred_id, public_key, counter)
+                 console.print(f"[dim]Passkey stored locally in {store.filename} for testing.[/dim]")
+                 console.print(f"[green]You can now login with: hvpdb login-passkey {user} --native[/green]")
+                  
+             except Exception as e:
+                 console.print(f"[yellow]Warning: Could not store passkey locally: {e}[/yellow]")
+        
+        return
+
+    # Fallback to QR Code mode (previous logic)
+    try:
+        import qrcode
+    except ImportError:
+        console.print('[red]Error: "qrcode" library is required.[/red]')
+        raise typer.Exit(1)
+        
+    # Get local IP
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # doesn't even have to be reachable
+        s.connect(('10.255.255.255', 1))
+        local_ip = s.getsockname()[0]
+    except Exception:
+        local_ip = '127.0.0.1'
+    finally:
+        s.close()
+        
+    url = f"http://{local_ip}:{port}/webauthn/register?user={user}"
+    
+    console.print(Panel(f"Scan to Register Passkey for: [bold]{user}[/bold]", title="WebAuthn Registration (Mobile)"))
+    
+    qr_img = qrcode.QRCode()
+    qr_img.add_data(url)
+    qr_img.print_ascii(tty=True)
+    
+    console.print(f"[dim]URL: {url}[/dim]")
+    console.print("\n[yellow]⚠️  IMPORTANT:[/yellow]")
+    console.print("1. Ensure your phone is on the same Wi-Fi as this computer.")
+    console.print("2. Since this is HTTP (not HTTPS), WebAuthn might be blocked by mobile browsers.")
+    console.print("   You may need to enable 'Unsafe Origins' in chrome://flags on Android.")
+    console.print("\n[cyan]Tip: Use --native to create Passkey on this Windows PC directly.[/cyan]")
+    console.print("\n[green]Starting temporary server... Press Ctrl+C to stop.[/green]")
+    
+    # Start simple server
+    from .webauthn_server import run_server
+    run_server(host, port, user)
+
+@app.command(name='login-passkey', help='Login using Passkey.')
+def hvpdb_login_passkey(
+    user: str = typer.Argument(..., help='Username'),
+    native: Optional[bool] = typer.Option(None, '--native', help='Use native Windows Hello (Auto-detects OS)')
+):
+    """
+    Authenticate using a Passkey.
+    Supports Native Windows Hello and (Planned) QR Login.
+    """
+    current_os = platform.system()
+    if native is None:
+        native = (current_os == 'Windows')
+        if not native:
+             console.print(f"[dim]Auto-detected OS: {current_os}. Native login not supported.[/dim]")
+
+    if not native:
+        console.print("[yellow]QR/Remote login is not yet implemented for Linux/Mac.[/yellow]")
+        console.print("[dim]Please use 'hvpdb login-passkey --native' if you are on Windows, or use password/key.[/dim]")
+        return
+
+    # Fix imports path like in gen-passkey
+    import site
+    import sys
+    user_site = site.getusersitepackages()
+    if user_site not in sys.path:
+        sys.path.append(user_site)
+    fallback_site = os.path.expandvars(r'%APPDATA%\Python\Python314\site-packages')
+    if os.path.exists(fallback_site) and fallback_site not in sys.path:
+        sys.path.append(fallback_site)
+        
+    try:
+        from .passkey_store import PasskeyStore
+        from .fido_native import authenticate_passkey_windows
+    except ImportError:
+         console.print("[red]Dependencies missing.[/red]")
+         raise typer.Exit(1)
+         
+    store = PasskeyStore()
+    passkeys = store.get_passkeys(user)
+    
+    if not passkeys:
+        console.print(f"[red]No passkeys found for user '{user}' in local store.[/red]")
+        console.print(f"[yellow]Please run 'gen-passkey {user} --native' first.[/yellow]")
+        return
+        
+    success = authenticate_passkey_windows(user, "localhost", passkeys)
+    if success:
+        console.print(f"[bold green]Login Successful for user: {user}[/bold green]")
+    else:
+        console.print("[bold red]Login Failed.[/bold red]")
+        raise typer.Exit(1)
 
 @app.command(name='gen-key', help='Generate a new Access Key.')
 def hvpdb_gen_key(
@@ -667,7 +913,7 @@ def hvpdb_gen_key(
     alphabet = string.ascii_letters + string.digits
     key = ''.join(secrets.choice(alphabet) for i in range(64))
     
-    console.print(Panel(f'[bold green]{key}[/bold green]', title='New Access Key'))
+    console.print(Panel(f'[bold green]{key}[/bold green]', title='New Access Key (Raw)'))
     
     if save:
         try:
@@ -686,11 +932,12 @@ def hvpdb_gen_key(
         try:
             import qrcode
             qr_img = qrcode.QRCode()
-            # Generate a URI for easier mobile integration (Passkey-like experience)
-            uri = f"hvpdb://setup?key={key}&type=access_key"
+            # Note: This URI is for importing into compatible apps, NOT for creating a FIDO2 Passkey.
+            uri = f"hvpdb://import?key={key}&type=access_key"
             qr_img.add_data(uri)
             qr_img.print_ascii(tty=True)
-            console.print(f"[dim]QR URI: {uri}[/dim]")
+            console.print(f"[dim]QR Code for App Import (URI: {uri})[/dim]")
+            console.print("[yellow]Note: This is an Access Key import QR, not a FIDO2 Passkey creation request.[/yellow]")
         except ImportError:
             console.print('[yellow]Install "qrcode" to view QR codes: pip install qrcode[/yellow]')
 
@@ -983,6 +1230,63 @@ def hvpdb_show_help():
     console.print('\n[bold underline]Usage Examples:[/bold underline]')
     console.print('  [white]hvpdb[/white] [bold cyan]init[/bold cyan] [yellow]my_db[/yellow]')
     console.print('  [white]hvpdb[/white] [bold cyan]deploy[/bold cyan] [yellow]my_db[/yellow] [blue]8080[/blue]')
+@app.command(name='shell', help='Start the interactive HVPDB shell.\n\nUsage: hvpdb shell [target] [command] [options]')
+def hvpdb_shell(
+    target: Optional[str] = typer.Argument(None, help='Database Target (Optional)'),
+    command: Optional[str] = typer.Argument(None, help='Single command to execute (Optional)'),
+    password: Optional[str] = typer.Argument(None, help='Password (Optional)'),
+    passfile: Optional[str] = typer.Option(None, '--passfile', help='Read password from file'),
+    use_passkey: bool = typer.Option(False, '--passkey', help='Authenticate using Passkey'),
+    username: str = typer.Option('admin', '--user', '-u', help='Username for Passkey auth')
+):
+    """
+    Launch the interactive shell for advanced database operations.
+    """
+    from .hvpshell import HVPShell
+    
+    # Handle Passkey Auth
+    if use_passkey:
+        try:
+            from .passkey_auth import authenticate_user
+            from .passkey_store import PasskeyStore
+            store = PasskeyStore()
+            retrieved_password = authenticate_user(username, store)
+            if retrieved_password:
+                password = retrieved_password
+            else:
+                # Auth failed or no password found, exit to prevent unauthorized access
+                raise typer.Exit(code=1)
+        except ImportError as e:
+            console.print(f"[red]Passkey authentication requires additional dependencies (fido2). Error: {e}[/red]")
+            raise typer.Exit(code=1)
+    
+    # Handle password from file
+    if passfile and os.path.exists(passfile):
+        with open(passfile, 'r') as f:
+            password = f.read().strip()
+            
+    db = None
+    if target:
+        try:
+            db = hvpdb_get_db(target, password)
+        except Exception as e:
+            if not command: # Only show warning in interactive mode
+                console.print(f"[yellow]Starting shell without connection due to error: {e}[/yellow]")
+            else:
+                # In command mode, failure to connect is fatal
+                console.print(f"[red]Connection failed: {e}[/red]")
+                raise typer.Exit(code=1)
+            
+    shell = HVPShell(db)
+    
+    if command:
+        # Support multiple commands separated by '+' (as seen in tests: "target users+peek")
+        cmds = command.split('+')
+        for cmd in cmds:
+            shell.onecmd(cmd)
+    else:
+        shell.cmdloop()
+
 if __name__ == '__main__':
     help_triggers = {'-h', '-H', '--h', '--H', '-help', '--help', '--HELP', '-HELP', 'help', 'HELP'}
     if len(sys.argv) > 1 and sys.argv[1] in help_triggers:

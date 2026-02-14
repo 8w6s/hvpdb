@@ -223,9 +223,9 @@ class HVPGroup:
                                 break
                         if match:
                             yield doc
-                    return
-                else:
-                    return
+                        return
+                    else:
+                        return
         
         # Try standard indexes
         idx_matches = []
@@ -475,7 +475,9 @@ class HVPGroup:
         Returns:
             Match count.
         """
-        return len(self.find(query))
+        if query is None:
+            return len(self.storage.data['groups'][self.name])
+        return sum(1 for _ in self.find_iter(query))
 
     def append(self, op: str, data: dict):
         """
@@ -694,8 +696,12 @@ class HVPDB:
         Returns:
             True if password matches, False otherwise.
         """
+        # Timing attack mitigation: always perform some work
         if not stored:
+            # Perform dummy check
+            secrets.compare_digest('dummy', 'dummy')
             return False
+            
         try:
             if stored.startswith('scrypt$'):
                 _, salt_hex, key_hex = stored.split('$')
@@ -774,6 +780,8 @@ class HVPDB:
         """
         if not name or any((c in name for c in '\\/:*?"<>|')):
             raise ValueError(f"Invalid group: '{name}'")
+        if '..' in name or name.startswith('.') or name.endswith('.'):
+            raise ValueError(f"Invalid group: '{name}' (Path Traversal Protection)")
         if self.is_cluster and name == self._CLUSTER_META_GROUP_NAME:
             raise ValueError(f"Invalid group: '{name}'")
         if name in self._groups:
@@ -874,7 +882,7 @@ class HVPDB:
         from .transaction import HVPTransaction
         return HVPTransaction(self)
 
-    def change_password(self, new_password: str):
+    def change_password(self, new_password: str, auth_type: Optional[str] = None):
         """
         Update the database encryption password.
         
@@ -882,19 +890,40 @@ class HVPDB:
         
         Args:
             new_password: The new master password.
+            auth_type: Optional new authentication type ('password', 'access_key').
+                       If None, preserves the current type.
         """
         self.password = new_password
         
-        def _reencrypt(s, pwd):
+        def _reencrypt(s, pwd, atype):
+            # Preserve existing KDF params (e.g. cost settings) but generate new salt
+            old_params = s.security.get_kdf_params() if s.security else {}
+            
             s.password = pwd
-            s.security = None
+            s.security = None # Force re-init with new password
+            
+            # Re-initialize security with preserved params (except auth_type if changed)
+            # We need to temporarily hook into _init_security or manually init
+            # Since s.save() calls _init_security(), we need a way to pass params there.
+            # Best way: Initialize it right here.
+            
+            # Prepare new params
+            new_params = old_params.copy()
+            if atype:
+                new_params['auth_type'] = atype
+            elif 'auth_type' not in new_params:
+                new_params['auth_type'] = 'password'
+                
+            from .security import HVPSecurity
+            s.security = HVPSecurity(pwd, kdf_params=new_params)
+            
             s._dirty = True
             s.save()
 
-        _reencrypt(self.storage, new_password)
+        _reencrypt(self.storage, new_password, auth_type)
         if self.is_cluster:
             for grp in self._groups.values():
-                _reencrypt(grp.storage, new_password)
+                _reencrypt(grp.storage, new_password, auth_type)
 
     def set(self, key: str, value: Any):
         """

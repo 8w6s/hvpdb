@@ -68,6 +68,11 @@ class HVPTransaction:
     def __enter__(self):
         if getattr(self.db, 'is_cluster', False):
             raise RuntimeError('Transactions not supported in cluster mode.')
+        
+        # Prevent nested transactions
+        if self.db.current_txn:
+            raise RuntimeError(f'Nested transactions are not supported. Current transaction: {self.db.current_txn}')
+            
         self._txn_id = self.db.storage.begin_txn()
         self._token = self.db._txn_ctx.set(self._txn_id)
         return self
@@ -97,39 +102,64 @@ class HVPTransaction:
         if self._committed:
             raise ValueError('Transaction already committed')
         
-        # Use storage-level writer lock for entire commit process to ensure atomicity
-        # between WAL writes and in-memory updates.
-        with self.db.storage.lock_manager.writer_lock():
-            if self.ops:
-                if self._txn_id:
-                    for op in self.ops:
-                        self.db.storage.append_log(op['op'], op['g'], op['id'], op['d'], txn_id=self._txn_id)
-                else:
-                    self.db.storage.append_batch_log(self.ops)
-            if self._txn_id:
-                self.db.storage.commit_txn(self._txn_id)
-            
-            # Apply to memory atomically with WAL write
-            for op in self.ops:
-                grp = self.db.group(op['g'])
-                try:
+        try:
+            # Use storage-level writer lock for entire commit process to ensure atomicity
+            # between WAL writes and in-memory updates.
+            with self.db.storage.lock_manager.writer_lock():
+                # Validate operations before committing to WAL
+                for op in self.ops:
+                    grp = self.db.group(op['g'])
                     if op['op'] == 'insert':
-                        grp._insert_mem(op['d'])
-                    elif op['op'] == 'update':
-                        current_doc = grp.storage.data['groups'][op['g']].get(op['id'])
-                        if current_doc:
-                            grp._update_mem(op['id'], op['d'], current_doc)
-                    elif op['op'] == 'delete':
-                        current_doc = grp.storage.data['groups'][op['g']].get(op['id'])
-                        if current_doc:
-                            grp._delete_mem(op['id'], current_doc)
-                except ValueError as e:
-                    # In a critical section, memory update failures are catastrophic for consistency
-                    # However, since we validated before (hopefully), this is rare.
-                    print(f'Critical Error applying transaction to memory: {e}')
-                    
-            self._committed = True
-            self.ops = []
+                        # Check ID conflict
+                        if op['id'] in grp.storage.data['groups'][op['g']]:
+                            raise ValueError(f"Transaction Aborted: Duplicate ID {op['id']}")
+                        # Check unique index conflict (against current committed state)
+                        for field, unique_map in grp.unique_indexes.items():
+                             val = op['d'].get(field)
+                             if val is not None and val in unique_map:
+                                  raise ValueError(f"Transaction Aborted: Duplicate unique key '{field}': '{val}'")
+
+                if self.ops:
+                    if self._txn_id:
+                        for op in self.ops:
+                            self.db.storage.append_log(op['op'], op['g'], op['id'], op['d'], txn_id=self._txn_id)
+                    else:
+                        self.db.storage.append_batch_log(self.ops)
+                if self._txn_id:
+                    # Don't trigger checkpoint inside lock to avoid deadlock
+                    self.db.storage.commit_txn(self._txn_id, check_auto_checkpoint=False)
+                
+                # Apply to memory atomically with WAL write
+                for op in self.ops:
+                    grp = self.db.group(op['g'])
+                    try:
+                        if op['op'] == 'insert':
+                            grp._insert_mem(op['d'])
+                        elif op['op'] == 'update':
+                            current_doc = grp.storage.data['groups'][op['g']].get(op['id'])
+                            if current_doc:
+                                grp._update_mem(op['id'], op['d'], current_doc)
+                        elif op['op'] == 'delete':
+                            current_doc = grp.storage.data['groups'][op['g']].get(op['id'])
+                            if current_doc:
+                                grp._delete_mem(op['id'], current_doc)
+                    except ValueError as e:
+                        # In a critical section, memory update failures are catastrophic for consistency
+                        # We must force a refresh to resync memory with WAL
+                        print(f'Critical Error applying transaction to memory: {e}. Forcing refresh.')
+                        self.db.refresh(force=True)
+                        raise
+                        
+                self._committed = True
+                self.ops = []
+
+            # Check for auto-checkpoint after releasing the lock
+            self.db.storage._check_auto_checkpoint()
+            
+        except Exception:
+            # Ensure cleanup on failure
+            self.rollback()
+            raise
 
     def rollback(self):
         if self._txn_id:

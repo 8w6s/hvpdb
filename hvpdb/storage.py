@@ -3,7 +3,7 @@ import os
 import shutil
 import time
 import warnings
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, Optional, cast
 
 import msgpack
 import portalocker
@@ -208,109 +208,127 @@ class HVPStorage:
             group_data[data['_id']] = data
 
     def save(self):
-        """Compress, encrypt, and atomically save the database to disk."""
+        """Compress, encrypt, and atomically save the database to disk (Manual trigger)."""
+        self.checkpoint()
+
+    def checkpoint(self):
+        """
+        Perform a full checkpoint: Serialize memory -> Disk, Truncate WAL.
+        Acquires writer_lock to ensure exclusivity.
+        """
+        print("[CHECKPOINT] Starting checkpoint operation...")
         with self.lock_manager.writer_lock():
-            self._init_security()
-            if self.security is None:
-                raise RuntimeError("Security context not initialized")
-            self.data['seq'] = self._last_sequence
-            packed_data = cast(bytes, msgpack.packb(self.data, use_bin_type=True, default=default_serializer))
-            compressed_data = self.cctx.compress(packed_data)
-            salt = self.security.get_salt()
-            kdf_params = self.security.get_kdf_params()
-            kdf_bytes = cast(bytes, msgpack.packb(kdf_params))
-            kdf_len = len(kdf_bytes)
-            aad = HEADER + VERSION.to_bytes(2, 'big') + salt + kdf_len.to_bytes(2, 'big') + kdf_bytes
-            nonce, ciphertext = self.security.encrypt(compressed_data, associated_data=aad)
-            temp_path = self.filepath + '.tmp'
+            self._save_internal()
+            self.wal.truncate()
+        print("[CHECKPOINT] Checkpoint completed successfully.")
+
+    def _save_internal(self):
+        """Internal save implementation. Expects writer lock to be held."""
+        self._init_security()
+        if self.security is None:
+            raise RuntimeError("Security context not initialized")
+        self.data['seq'] = self._last_sequence
+        packed_data = cast(bytes, msgpack.packb(self.data, use_bin_type=True, default=default_serializer))
+        compressed_data = self.cctx.compress(packed_data)
+        salt = self.security.get_salt()
+        kdf_params = self.security.get_kdf_params()
+        kdf_bytes = cast(bytes, msgpack.packb(kdf_params))
+        kdf_len = len(kdf_bytes)
+        aad = HEADER + VERSION.to_bytes(2, 'big') + salt + kdf_len.to_bytes(2, 'big') + kdf_bytes
+        nonce, ciphertext = self.security.encrypt(compressed_data, associated_data=aad)
+        temp_path = self.filepath + '.tmp'
+        try:
+            # Try to open with secure permissions (0o600)
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        except OSError as e:
+            # Termux/Android shared storage often doesn't support setting permissions (ENOSYS/EPERM)
+            # 38=ENOSYS, 1=EPERM, 95=EOPNOTSUPP
+            if e.errno in (errno.ENOSYS, errno.EPERM, getattr(errno, 'EOPNOTSUPP', 95)) or 'not implemented' in str(e).lower():
+                    print(f"Warning: Could not set secure permissions on {temp_path}. File may be readable by other users.")
+                    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+            else:
+                raise
+        with os.fdopen(fd, 'wb') as f:
             try:
-                # Try to open with secure permissions (0o600)
-                fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            except OSError as e:
-                # Termux/Android shared storage often doesn't support setting permissions (ENOSYS/EPERM)
-                # 38=ENOSYS, 1=EPERM, 95=EOPNOTSUPP
-                if e.errno in (errno.ENOSYS, errno.EPERM, getattr(errno, 'EOPNOTSUPP', 95)) or 'not implemented' in str(e).lower():
-                     print(f"Warning: Could not set secure permissions on {temp_path}. File may be readable by other users.")
-                     fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-                else:
-                    raise
-            with os.fdopen(fd, 'wb') as f:
+                acquire_interruptible_lock(f)
+            except (OSError, portalocker.LockException):
+                pass
+            try:
+                f.write(HEADER)
+                f.write(VERSION.to_bytes(2, 'big'))
+                f.write(salt)
+                f.write(kdf_len.to_bytes(2, 'big'))
+                f.write(kdf_bytes)
+                f.write(nonce)
+                f.write(ciphertext)
+                f.flush()  # Ensure data is pushed to OS buffer
+                os.fsync(f.fileno())  # Ensure data is physically written to disk
+            finally:
                 try:
-                    acquire_interruptible_lock(f)
-                except (OSError, portalocker.LockException):
+                    portalocker.unlock(f)
+                except OSError:
                     pass
+        with self.lock_manager.critical_swap_lock():
+            retries = 5
+            while retries > 0:
                 try:
-                    f.write(HEADER)
-                    f.write(VERSION.to_bytes(2, 'big'))
-                    f.write(salt)
-                    f.write(kdf_len.to_bytes(2, 'big'))
-                    f.write(kdf_bytes)
-                    f.write(nonce)
-                    f.write(ciphertext)
-                    f.flush()  # Ensure data is pushed to OS buffer
-                    os.fsync(f.fileno())  # Ensure data is physically written to disk
-                finally:
-                    try:
-                        portalocker.unlock(f)
-                    except OSError:
-                        pass
-            with self.lock_manager.critical_swap_lock():
-                retries = 5
-                while retries > 0:
-                    try:
-                        os.replace(temp_path, self.filepath)
-                        
-                        # Write Barrier: Ensure directory metadata entry is persisted
-                        # This guarantees the file replacement is atomic and durable
-                        if hasattr(os, 'open') and hasattr(os, 'fsync'):
+                    os.replace(temp_path, self.filepath)
+                    
+                    # Write Barrier: Ensure directory metadata entry is persisted
+                    # This guarantees the file replacement is atomic and durable
+                    if hasattr(os, 'open') and hasattr(os, 'fsync'):
+                        try:
+                            dir_fd = os.open(os.path.dirname(os.path.abspath(self.filepath)), os.O_RDONLY)
                             try:
-                                dir_fd = os.open(os.path.dirname(os.path.abspath(self.filepath)), os.O_RDONLY)
-                                try:
-                                    os.fsync(dir_fd)
-                                finally:
-                                    os.close(dir_fd)
-                            except (OSError, ValueError):
-                                # Directory fsync might not be supported on all platforms/filesystems
-                                pass
-                        
-                        break
-                    except OSError as e:
-                        # Handle Termux/FUSE limitations (ENOSYS/EPERM/EXDEV)
-                        if e.errno in (errno.ENOSYS, errno.EPERM, errno.EXDEV, getattr(errno, 'EOPNOTSUPP', 95)) or 'not implemented' in str(e).lower():
+                                os.fsync(dir_fd)
+                            finally:
+                                os.close(dir_fd)
+                        except (OSError, ValueError):
+                            # Directory fsync might not be supported on all platforms/filesystems
+                            pass
+                    
+                    break
+                except OSError as e:
+                    # Handle Termux/FUSE limitations (ENOSYS/EPERM/EXDEV)
+                    if e.errno in (errno.ENOSYS, errno.EPERM, errno.EXDEV, getattr(errno, 'EOPNOTSUPP', 95)) or 'not implemented' in str(e).lower():
+                        try:
+                            if os.path.exists(self.filepath):
+                                os.remove(self.filepath)
+                            os.rename(temp_path, self.filepath)
+                            break
+                        except OSError:
+                            # If rename also fails, try shutil.move as last resort
                             try:
-                                if os.path.exists(self.filepath):
-                                    os.remove(self.filepath)
-                                os.rename(temp_path, self.filepath)
+                                shutil.move(temp_path, self.filepath)
                                 break
                             except OSError:
-                                # If rename also fails, try shutil.move as last resort
-                                try:
-                                    shutil.move(temp_path, self.filepath)
-                                    break
-                                except OSError:
-                                    pass  # Retry logic will handle this
+                                pass  # Retry logic will handle this
 
-                        retries -= 1
-                        if retries == 0:
-                            raise
-                        time.sleep(0.1)
-                self.wal.truncate()
-            self._dirty = False
+                    retries -= 1
+                    if retries == 0:
+                        raise
+                    time.sleep(0.1)
+            self.wal.truncate()
+        self._dirty = False
 
-    def commit(self):
-        """
-        Persist in-memory changes to the WAL and optionally to the main file.
-        """
+    def _check_auto_checkpoint(self):
+        """Internal: Check if WAL size exceeds threshold and trigger checkpoint."""
         if not self.durable:
             return
         
         # Check WAL size for auto-checkpoint
         try:
             if os.path.exists(self.log_path) and os.path.getsize(self.log_path) > self.wal_checkpoint_threshold:
-                self.save()
-                return
+                print(f"[AUTO-CHECKPOINT] WAL size {os.path.getsize(self.log_path)} exceeds threshold {self.wal_checkpoint_threshold}. Triggering checkpoint.")
+                self.checkpoint()
         except OSError:
             pass
+
+    def commit(self):
+        """
+        Persist in-memory changes to the WAL and optionally to the main file.
+        """
+        self._check_auto_checkpoint()
 
         if self._dirty:
             # In durable mode, we rely on WAL. 
@@ -333,12 +351,13 @@ class HVPStorage:
         self._txn_buffers[txn_id].append(entry)
         return txn_id
 
-    def commit_txn(self, txn_id: str):
+    def commit_txn(self, txn_id: str, check_auto_checkpoint: bool = True):
         """
         Commit a transaction and sync its operations to the WAL.
         
         Args:
             txn_id: The ID of the transaction to commit.
+            check_auto_checkpoint: Whether to check/trigger auto-checkpoint.
         """
         self._init_security()
         self._last_sequence += 1
@@ -349,18 +368,59 @@ class HVPStorage:
             del self._txn_buffers[txn_id]
         else:
             self.wal.log_commit(self._last_sequence, txn_id)
+            
+        # Trigger auto-checkpoint check after transaction commit
+        if check_auto_checkpoint:
+            self._check_auto_checkpoint()
 
     def rollback_txn(self, txn_id: str):
         """
-        Roll back a transaction and discard its operations.
+        Roll back a transaction, restore RAM state, and discard its operations.
         
         Args:
             txn_id: The ID of the transaction to roll back.
         """
         self._init_security()
         self._last_sequence += 1
+        
+        # Restore RAM state from buffer
         if txn_id in self._txn_buffers:
+            # Iterate backwards to undo changes
+            for entry in reversed(self._txn_buffers[txn_id]):
+                if entry.get('type') != 'DATA':
+                    continue
+                
+                op = entry.get('op')
+                group_name = entry.get('g')
+                doc_id = entry.get('id')
+                before_image = entry.get('b')
+                
+                if not group_name or not doc_id:
+                    continue
+                    
+                if group_name not in self.data['groups']:
+                    continue
+                    
+                group_data = self.data['groups'][group_name]
+                
+                # Undo based on operation
+                if op == 'insert':
+                    # Undo insert = delete
+                    if doc_id in group_data:
+                        del group_data[doc_id]
+                elif op == 'update':
+                    # Undo update = restore before_image
+                    if before_image:
+                        group_data[doc_id] = before_image
+                elif op == 'delete':
+                    # Undo delete = insert before_image
+                    if before_image:
+                        group_data[doc_id] = before_image
+            
+            # Clear buffer
             del self._txn_buffers[txn_id]
+            self._dirty = True # Mark dirty because we modified RAM (reverted)
+            
         self.wal.log_rollback(self._last_sequence, txn_id)
 
     def append_log(self, op: str, group_name: str, doc_id: str, data: dict, txn_id: Optional[str]=None, before_image: Optional[dict]=None):

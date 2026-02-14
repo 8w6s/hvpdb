@@ -135,13 +135,18 @@ class HVPWAL:
         packed = cast(bytes, msgpack.packb(entry, use_bin_type=True, default=default_serializer))
         compressed = self.cctx.compress(packed)
         nonce, ciphertext = self.security.encrypt_chunk(compressed)
+        
+        # Calculate CRC over everything including nonce and ciphertext
         payload = nonce + ciphertext
         crc = zlib.crc32(payload)
         length = len(ciphertext)
+        
         self._open_log()
         if self._file_handle is None:
             raise RuntimeError("Failed to open WAL file")
         f = self._file_handle
+        
+        # Format: CRC(4) | Length(4) | Nonce(12) | Ciphertext(N)
         f.write(struct.pack('>I', crc))
         f.write(struct.pack('>I', length))
         f.write(nonce)
@@ -172,9 +177,11 @@ class HVPWAL:
             packed = cast(bytes, msgpack.packb(entry, use_bin_type=True, default=default_serializer))
             compressed = self.cctx.compress(packed)
             nonce, ciphertext = self.security.encrypt_chunk(compressed)
+            
             payload = nonce + ciphertext
             crc = zlib.crc32(payload)
             length = len(ciphertext)
+            
             f.write(struct.pack('>I', crc))
             f.write(struct.pack('>I', length))
             f.write(nonce)
@@ -263,9 +270,15 @@ class HVPWAL:
                     version = int.from_bytes(f.read(2), 'big')
                     if version != WAL_VERSION:
                         raise ConsistencyError(f'WAL Version Mismatch: Expected {WAL_VERSION}, got {version}.')
-                    f.read(16)
+                    
+                    file_salt = f.read(16)
                     kdf_len = int.from_bytes(f.read(2), 'big')
-                    f.read(kdf_len)
+                    file_kdf_bytes = f.read(kdf_len)
+                    
+                    if self.security:
+                        current_salt = self.security.get_salt()
+                        if current_salt and file_salt != current_salt:
+                            raise ConsistencyError(f"WAL salt mismatch! File: {file_salt.hex()}, Mem: {current_salt.hex()}")
                 else:
                     f.seek(0)
                 while True:

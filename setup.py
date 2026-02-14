@@ -4,7 +4,7 @@ with open('README.md', 'r', encoding='utf-8') as fh:
 
 setup(
     name='hvpdb',
-    version='1.0.4.post2',
+    version='1.0.6.post1',
     description='High Velocity Python Database (NoSQL, Embedded, Encrypted)',
     long_description=long_description,
     long_description_content_type='text/markdown',
@@ -20,7 +20,8 @@ setup(
         'zstandard>=0.21.0',
         'portalocker>=2.7.0',
         'pydantic>=2.0.0',
-        'prompt_toolkit>=3.0.0'
+        'prompt_toolkit>=3.0.0',
+        'fido2>=1.1.0'
     ],
     extras_require={
         'cli': ['typer>=0.9.0', 'rich>=13.0.0', 'prompt_toolkit>=3.0.0'],

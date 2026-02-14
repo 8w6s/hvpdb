@@ -52,3 +52,19 @@ claude.md
 CHANGELOG.md
 release_note.md
 WORKSPACE.md
+
+# Test Artifacts
+test_db_verification*
+verify_fixes*
+stress_test_db*
+stability_test_db*
+my_cluster*
+test_architecture*
+test_cluster*
+
+# Sensitive & Runtime Files
+hvpdb_passkeys.json
+hvpdb_passkeys.json.key
+runtime_pass.txt
+TEST_PASSKEY.md
+verify_fixes.py
