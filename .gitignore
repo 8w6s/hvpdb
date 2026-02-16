@@ -76,6 +76,11 @@ demo_passkey.py
 verify_partition_drop.py
 verify_fixes.py
 verify_process_stale.py
+verify_batch*.py
+verify_v107_*.py
+IDEAS.md
+gitbook_update_*.md
+hvpdb-1.0.7/
 run_ci.py
 
 # ---- Draft Documentation (replaced by hvpdb_definitive_reference.md) ----
