@@ -1,7 +1,16 @@
 # HVPDB v1.0.7 — Full Changelog (since v1.0.6)
 
+## [1.0.7.post1] - 2026-02-17 (Hotfix)
+### Fixed
+- **TTL Reaper**: Fixed bug where expired documents were hidden from reaper.
+- **Thread Safety**: Fixed race conditions in `find_iter` and `find_one` reload checks.
+- **Stale Reads**: Fixed stale read vulnerability in `find_one` optimization.
+- **Backup**: Fixed `db.backup()` failures on new databases (forced checkpoint).
+### Added
+- Internal support for `_include_expired` query parameter.
+
 > **Release Date**: 2026-02-16  
-> **Diff Stats**: 33 files changed, +6,076 insertions, −1,012 deletions  
+> **Diff Stats**: 33 files changed, +6,076 insertions, −1,012 deletions
 
 ---
 

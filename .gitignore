@@ -55,6 +55,10 @@ hvpdb_passkeys.json.key
 hvp/
 backups/
 users_dump.json
+test_*.hvp
+test_*.hvp.log
+test_*.hvp.lock
+test_*.hvp.writelock
 
 # ---- Test Artifacts ----
 test_db_verification*

@@ -265,6 +265,10 @@ class HVPStorage:
         if not snapshot_path.endswith('.hvp'):
             snapshot_path += '.hvp'
             
+        # Force checkpoint to ensure .hvp file is up-to-date and exists
+        # This flushes WAL and memory to the main file.
+        self.checkpoint()
+
         with self.lock_manager.reader_lock():
             if os.path.exists(self.filepath):
                 shutil.copy2(self.filepath, snapshot_path)

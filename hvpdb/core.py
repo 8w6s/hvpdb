@@ -79,7 +79,16 @@ class HVPGroup:
             return d
 
         if '_id' in query and len(query) == 1:
-            return _check(self.storage.data['groups'][self.name].get(query['_id']))
+            # Fix: Stale Read & Race Condition prevention
+            # Check reload and use lock for direct access
+            if self.db:
+                # Need to check if file changed before accessing memory
+                # This requires lock to prevent race during reload
+                with self.db._thread_lock:
+                    self.storage.check_reload()
+                    return _check(self.storage.data['groups'][self.name].get(query['_id']))
+            else:
+                 return _check(self.storage.data['groups'][self.name].get(query['_id']))
         for field, val in query.items():
             if field in self.unique_indexes and len(query) == 1:
                 doc_id = self.unique_indexes[field].get(val)
@@ -305,6 +314,15 @@ class HVPGroup:
                 self._query_cache.clear()
             self._query_cache[query_json] = res
         
+        # Filter expired documents from result (whether cached or fresh)
+        # fresh find_iter already does it, but cached result might strictly contain expired ones now
+        now = time.time()
+        
+        include_expired = query.get("_include_expired", False) if query else False
+        
+        if not include_expired:
+            res = [d for d in res if not (d.get("_expires_at") and d["_expires_at"] < now)]
+
         if skip > 0:
             res = res[skip:]
         if limit > 0:
@@ -326,7 +344,11 @@ class HVPGroup:
 
     def undelete(self, query: dict) -> int:
         """Restore soft-deleted documents."""
-        return self.update(query, {"_deleted": False})
+        # Ensure we can find the deleted documents
+        q = query.copy()
+        if '_deleted' not in q:
+            q['_deleted'] = True
+        return self.update(q, {"_deleted": False})
 
     def bulk_insert(self, docs: List[dict]) -> List[dict]:
         """
@@ -386,20 +408,35 @@ class HVPGroup:
         if self.name not in self.storage.data['groups']:
             return iter([])
         
-        # Check for external updates (Stale Reads fix)
-        self.storage.check_reload()
+        # Fix: Race Condition - Check reload MUST be inside lock
+        # self.storage.check_reload() <- Moved inside lock below
 
         lock = self.db._thread_lock if self.db else contextlib.nullcontext()
         results = []
         
         with lock:
+            # Fix: Race Condition prevention
+            self.storage.check_reload()
+
             gdata = self.storage.data['groups'][self.name]
             now = time.time()
-            if not query:
-                # Filter expired
-                all_docs = [d for d in gdata.values() if not (d.get("_expires_at") and d["_expires_at"] < now)]
+            
+            # Support _include_expired logic
+            # Use copy to avoid side effect on user's query object
+            q = query.copy() if query else {}
+            include_expired = q.pop("_include_expired", False)
+
+            if not q:
+                # Filter expired and soft-deleted
+                all_docs = [
+                    d for d in gdata.values() 
+                    if (include_expired or not (d.get("_expires_at") and d["_expires_at"] < now))
+                    and not d.get("_deleted")
+                ]
                 yield from all_docs
                 return
+            
+            query = q # Use the cleaned query copy for further processing
             
             query = query or {}
             
@@ -429,7 +466,7 @@ class HVPGroup:
                         if doc_id in gdata:
                             doc = gdata[doc_id]
                             # Skip expired docs
-                            if doc.get("_expires_at") and doc["_expires_at"] < now:
+                            if not include_expired and doc.get("_expires_at") and doc["_expires_at"] < now:
                                 unique_match_found = True # Match technically found but ignored
                                 break
                             # Skip soft-deleted docs unless explicitly asked
@@ -473,7 +510,7 @@ class HVPGroup:
                             if doc_id in gdata:
                                 doc = gdata[doc_id]
                                 # Skip expired docs
-                                if doc.get("_expires_at") and doc["_expires_at"] < now:
+                                if not include_expired and doc.get("_expires_at") and doc["_expires_at"] < now:
                                     continue
                                 # Skip soft-deleted docs unless explicitly asked
                                 if doc.get("_deleted") and not (query and query.get("_deleted")):
@@ -484,7 +521,7 @@ class HVPGroup:
                         # Full scan fallback
                         for doc in gdata.values():
                             # Skip expired docs
-                            if doc.get("_expires_at") and doc["_expires_at"] < now:
+                            if not include_expired and doc.get("_expires_at") and doc["_expires_at"] < now:
                                 continue
                             # Skip soft-deleted docs unless explicitly asked
                             if doc.get("_deleted") and not (query and query.get("_deleted")):
@@ -820,9 +857,12 @@ class HVPDB:
                     now = time.time()
                     for group_name in self.get_all_groups():
                         group = self.group(group_name)
-                        expired = [d["_id"] for d in group.find({"_expires_at": {"$lt": now}}, limit=0) if "_expires_at" in d]
+                        # Fix: Must include expired docs to find them!
+                        query = {"_expires_at": {"$lt": now}, "_include_expired": True}
+                        expired = [d["_id"] for d in group.find(query, limit=0) if "_expires_at" in d]
                         if expired:
-                            group.delete({"_id": {"$in": expired}})
+                            # Fix: Delete must also include expired to find them
+                            group.delete({"_id": {"$in": expired}, "_include_expired": True})
                 except Exception as e:
                     warnings.warn(f"TTL Reaper Error: {e}")
         
