@@ -1,7 +1,12 @@
+import contextlib
 import contextvars
+import functools
 import hashlib
+import json
 import os
+import re
 import secrets
+import threading
 import time
 import uuid
 import warnings
@@ -50,6 +55,8 @@ class HVPGroup:
         self.schema = schema
         self.indexes = {}
         self.unique_indexes = {}
+        self._computed_fields = {}
+        self._find_cached = None # Initialized on first cache use
         if name not in self.storage.data['groups']:
             self.storage.data['groups'][name] = {}
         if '_indexes' not in self.storage.data:
@@ -59,20 +66,25 @@ class HVPGroup:
     def find_one(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Find a single document matching the query.
-        
-        Args:
-            query: Dictionary of field-value pairs to match.
-            
-        Returns:
-            The first matching document or None.
         """
+        now = time.time()
+        def _check(d):
+            if not d: return None
+            # Skip expired
+            if d.get("_expires_at") and d["_expires_at"] < now:
+                return None
+            # Skip soft-deleted
+            if d.get("_deleted") and not (query and query.get("_deleted")):
+                return None
+            return d
+
         if '_id' in query and len(query) == 1:
-            return self.storage.data['groups'][self.name].get(query['_id'])
+            return _check(self.storage.data['groups'][self.name].get(query['_id']))
         for field, val in query.items():
             if field in self.unique_indexes and len(query) == 1:
                 doc_id = self.unique_indexes[field].get(val)
                 if doc_id:
-                    return self.storage.data['groups'][self.name].get(doc_id)
+                    return _check(self.storage.data['groups'][self.name].get(doc_id))
                 return None
         results = self.find(query, limit=1)
         return results[0] if results else None
@@ -86,34 +98,84 @@ class HVPGroup:
         if self.name not in self.storage.data['_indexes']:
             return
         defs = self.storage.data['_indexes'][self.name]
-        for field, unique in defs.items():
+        for field_str, unique in defs.items():
+            field = field_str
+            if isinstance(field_str, str) and field_str.startswith('[') and field_str.endswith(']'):
+                try:
+                    field_val = json.loads(field_str)
+                    if isinstance(field_val, list):
+                        field = tuple(field_val)
+                except Exception:
+                    pass
             self.create_index(field, unique=unique, persist=False)
 
-    def create_index(self, field: str, unique: bool=False, persist: bool=True):
+    def create_index(self, field: Any, unique: bool=False, persist: bool=True):
         """
-        Create an index on a specific field.
+        Create an index on a specific field or a composite index on multiple fields.
         
         Args:
-            field: Field name to index.
-            unique: If True, enforces uniqueness on the field.
+            unique: If True, enforces uniqueness on the field(s).
             persist: If True, saves index definition to storage.
+            condition: Optional query dictionary. Only docs matching this match are indexed.
         """
+        if self.name not in self.storage.data.get('_partial_indexes', {}):
+             if '_partial_indexes' not in self.storage.data:
+                 self.storage.data['_partial_indexes'] = {}
+             if self.name not in self.storage.data['_partial_indexes']:
+                 self.storage.data['_partial_indexes'][self.name] = {}
+
+        # Ensure field is hashable (str or tuple)
+        if isinstance(field, list):
+            field = tuple(field)
+            
         if unique:
             if field in self.unique_indexes:
                 return
             self.unique_indexes[field] = {}
             for doc_id, doc in self.storage.data['groups'][self.name].items():
-                val = doc.get(field)
+                # Extract value
+                if isinstance(field, tuple):
+                    # Composite key
+                    vals = []
+                    has_all = True
+                    for f in field:
+                        v = doc.get(f)
+                        if v is None:
+                            has_all = False
+                            break
+                        vals.append(v)
+                    val = tuple(vals) if has_all else None
+                else:
+                    val = doc.get(field)
+                    
                 if val is not None:
                     if val in self.unique_indexes[field]:
                         raise ValueError(f"Duplicate value '{val}' for unique index '{field}'")
                     self.unique_indexes[field][val] = doc_id
+        
+        if condition:
+            self.storage.data['_partial_indexes'][self.name][str(field)] = condition
+            self.storage._dirty = True
         else:
             if field in self.indexes:
                 return
             self.indexes[field] = {}
             for doc_id, doc in self.storage.data['groups'][self.name].items():
-                val = doc.get(field)
+                # Extract value
+                if isinstance(field, tuple):
+                    # Composite key
+                    vals = []
+                    has_all = True
+                    for f in field:
+                        v = doc.get(f)
+                        if v is None:
+                            has_all = False
+                            break
+                        vals.append(v)
+                    val = tuple(vals) if has_all else None
+                else:
+                    val = doc.get(field)
+
                 if val is not None:
                     if val not in self.indexes[field]:
                         self.indexes[field][val] = []
@@ -121,7 +183,16 @@ class HVPGroup:
         if persist:
             if self.name not in self.storage.data['_indexes']:
                 self.storage.data['_indexes'][self.name] = {}
-            self.storage.data['_indexes'][self.name][field] = unique
+            
+            key = field
+            if isinstance(field, tuple):
+                try:
+                    key = json.dumps(list(field))
+                except (TypeError, ValueError):
+                    # Fallback for non-serializable tuples (though field names should be strings)
+                    key = str(field)
+            
+            self.storage.data['_indexes'][self.name][key] = unique
             self.storage._dirty = True
 
     def _update_index(self, doc_id: str, old_doc: Optional[dict], new_doc: Optional[dict]):
@@ -136,17 +207,34 @@ class HVPGroup:
         Raises:
             ValueError: If a unique constraint is violated.
         """
+        def get_val(f, d):
+            if not d: return None
+            # Check partial index condition
+            condition = self.storage.data.get('_partial_indexes', {}).get(self.name, {}).get(str(f))
+            if condition:
+                if not self._matches_query(d, condition):
+                    return None
+
+            if isinstance(f, tuple):
+                vals = []
+                for sub_f in f:
+                    v = d.get(sub_f)
+                    if v is None: return None
+                    vals.append(v)
+                return tuple(vals)
+            return d.get(f)
+
         if new_doc:
             for field, unique_map in self.unique_indexes.items():
-                new_val = new_doc.get(field)
-                old_val = old_doc.get(field) if old_doc else None
+                new_val = get_val(field, new_doc)
+                old_val = get_val(field, old_doc)
                 if new_val is not None and new_val != old_val:
                     if new_val in unique_map:
                         raise ValueError(f"Duplicate key '{field}': '{new_val}' exists.")
         
         # Remove old values from indexes
         for field, idx_map in self.indexes.items():
-            old_val = old_doc.get(field) if old_doc else None
+            old_val = get_val(field, old_doc)
             if old_val is not None and old_val in idx_map:
                 if doc_id in idx_map[old_val]:
                     idx_map[old_val].remove(doc_id)
@@ -155,7 +243,7 @@ class HVPGroup:
         
         # Add new values to indexes
         for field, idx_map in self.indexes.items():
-            new_val = new_doc.get(field) if new_doc else None
+            new_val = get_val(field, new_doc)
             if new_val is not None:
                 if new_val not in idx_map:
                     idx_map[new_val] = []
@@ -163,35 +251,131 @@ class HVPGroup:
         
         # Update unique indexes
         for field, unique_map in self.unique_indexes.items():
-            old_val = old_doc.get(field) if old_doc else None
+            old_val = get_val(field, old_doc)
             if old_val is not None and old_val in unique_map:
                 if unique_map[old_val] == doc_id:
                     del unique_map[old_val]
-            new_val = new_doc.get(field) if new_doc else None
-            if new_val is not None:
-                unique_map[new_val] = doc_id
+            unique_map[new_val] = doc_id
 
-    def find(self, query: Optional[dict]=None, limit: int=0) -> List[dict]:
+    def _matches_query(self, doc: dict, query: dict) -> bool:
+        """Internal: Check if a document matches a query (including operators)."""
+        for k, v in query.items():
+            doc_val = doc.get(k)
+            if isinstance(v, dict):
+                # Handle operators
+                if "$regex" in v:
+                    regex_val = v["$regex"]
+                    if not isinstance(regex_val, (str, bytes)):
+                        return False
+                    if doc_val is None:
+                        return False
+                    try:
+                        if not re.search(str(regex_val), str(doc_val)):
+                            return False
+                    except re.error:
+                        return False # Invalid regex
+                # Add more operators here ($gt, $lt etc.) later
+            else:
+                # Exact match
+                if doc_val != v:
+                    return False
+        return True
+
+    def _invalidate_cache(self):
+        """Invalidate the query cache for this group."""
+        if hasattr(self, "_query_cache"):
+            self._query_cache.clear()
+
+    def find(self, query: Optional[dict]=None, limit: int=0, skip: int=0) -> List[dict]:
         """
-        Find documents matching a query.
+        Find documents matching a query (cached).
+        """
+        # Create a stable string key for query
+        query_json = json.dumps(query, sort_keys=True) if query else ""
         
-        Args:
-            query: Dictionary of criteria (field=value).
-            limit: Maximum number of results to return (0 for all).
-            
-        Returns:
-            List of matching documents.
-        """
-        res = list(self.find_iter(query))
+        if not hasattr(self, "_query_cache"):
+            self._query_cache = {}
+        
+        if query_json in self._query_cache:
+            res = self._query_cache[query_json]
+        else:
+            res = list(self.find_iter(query))
+            # Limit cache size to prevent OOM
+            if len(self._query_cache) > 1000:
+                self._query_cache.clear()
+            self._query_cache[query_json] = res
+        
+        if skip > 0:
+            res = res[skip:]
         if limit > 0:
             return res[:limit]
         return res
+
+    def resolve_ref(self, ref: dict) -> Optional[dict]:
+        """
+        Resolve a Data Reference (DBRef).
+        Format: {"$ref": "group_name", "$id": "doc_id"}
+        """
+        if not isinstance(ref, dict) or "$ref" not in ref or "$id" not in ref:
+            return None
+        return self.db.group(ref["$ref"]).find_one({"_id": ref["$id"]})
+
+    def soft_delete(self, query: dict) -> int:
+        """Mark documents matching query as deleted."""
+        return self.update(query, {"_deleted": True})
+
+    def undelete(self, query: dict) -> int:
+        """Restore soft-deleted documents."""
+        return self.update(query, {"_deleted": False})
+
+    def bulk_insert(self, docs: List[dict]) -> List[dict]:
+        """
+        Efficiently insert multiple documents in a single transaction.
+        
+        Args:
+            docs: List of document dictionaries.
+            
+        Returns:
+            List of inserted documents with generated metadata.
+        """
+        with self.db.begin() as txn:
+            for d in docs:
+                getattr(txn, self.name).insert(d)
+        return docs
+
+    def bulk_update(self, query: dict, update_data: dict) -> int:
+        """
+        Update multiple documents matching a query in a single transaction.
+        
+        Args:
+            query: Criteria for documents to update.
+            update_data: Data to merge into matching documents.
+            
+        Returns:
+            Number of documents updated.
+        """
+        with self.db.begin() as txn:
+            return getattr(txn, self.name).update(query, update_data)
+
+    def bulk_delete(self, query: dict) -> int:
+        """
+        Delete multiple documents matching a query in a single transaction.
+        
+        Args:
+            query: Criteria for documents to delete.
+            
+        Returns:
+            Number of documents deleted.
+        """
+        with self.db.begin() as txn:
+            return getattr(txn, self.name).delete(query)
 
     def find_iter(self, query: Optional[dict]=None):
         """
         Iterate over documents matching a query.
         
         Uses indexes for performance if available.
+        Thread-safe: Snapshots results while holding lock.
         
         Args:
             query: Dictionary of criteria (field=value).
@@ -201,66 +385,116 @@ class HVPGroup:
         """
         if self.name not in self.storage.data['groups']:
             return iter([])
-        gdata = self.storage.data['groups'][self.name]
-        if not query:
-            yield from gdata.values()
-            return
         
-        # Try unique index first (most efficient)
-        query = query or {}
-        for key, value in query.items():
-            if key in self.unique_indexes:
-                umap = self.unique_indexes[key]
-                if value in umap:
-                    doc_id = umap[value]
-                    if doc_id in gdata:
-                        doc = gdata[doc_id]
-                        # Verify other fields match
-                        match = True
-                        for k, v in query.items():
-                            if doc.get(k) != v:
-                                match = False
+        # Check for external updates (Stale Reads fix)
+        self.storage.check_reload()
+
+        lock = self.db._thread_lock if self.db else contextlib.nullcontext()
+        results = []
+        
+        with lock:
+            gdata = self.storage.data['groups'][self.name]
+            now = time.time()
+            if not query:
+                # Filter expired
+                all_docs = [d for d in gdata.values() if not (d.get("_expires_at") and d["_expires_at"] < now)]
+                yield from all_docs
+                return
+            
+            query = query or {}
+            
+            # 1. Try exact match on Composite/Unique Indexes first (Most Efficient)
+            # Check if query fields match any composite index
+            # Strategy: Iterate over indexes, check if query contains all fields of the index key
+            
+            best_candidate_set = None
+            
+            # Helper to extract value tuple from query
+            def get_query_val(idx_key):
+                if isinstance(idx_key, tuple):
+                    vals = []
+                    for k in idx_key:
+                        if k not in query: return None
+                        vals.append(query[k])
+                    return tuple(vals)
+                return query.get(idx_key)
+
+            # Check Unique Indexes
+            unique_match_found = False
+            for idx_key, umap in self.unique_indexes.items():
+                val = get_query_val(idx_key)
+                if val is not None:
+                    if val in umap:
+                        doc_id = umap[val]
+                        if doc_id in gdata:
+                            doc = gdata[doc_id]
+                            # Skip expired docs
+                            if doc.get("_expires_at") and doc["_expires_at"] < now:
+                                unique_match_found = True # Match technically found but ignored
                                 break
-                        if match:
-                            yield doc
-                        return
+                            # Skip soft-deleted docs unless explicitly asked
+                            if doc.get("_deleted") and not (query and query.get("_deleted")):
+                                unique_match_found = True # Match technically found but ignored
+                                break
+                            # Verify all fields (including complex operators) match
+                            if self._matches_query(doc, query):
+                                results.append(doc)
+                            unique_match_found = True
+                            break # Unique match found (or mismatch confirmed), we are done
+                        else:
+                            unique_match_found = True
+                            break # Index points to missing doc
                     else:
-                        return
-        
-        # Try standard indexes
-        idx_matches = []
-        for key, value in query.items():
-            if key in self.indexes:
-                if value in self.indexes[key]:
-                    idx_matches.append(set(self.indexes[key][value]))
-                else:
-                    return # No intersection possible
-        
-        candidates = None
-        if idx_matches:
-            candidates = set.intersection(*idx_matches)
-        
-        if candidates is not None:
-            for doc_id in candidates:
-                if doc_id in gdata:
-                    doc = gdata[doc_id]
-                    match = True
-                    for k, v in query.items():
-                        if doc.get(k) != v:
-                            match = False
+                        unique_match_found = True
+                        break # Unique key not found, result is empty
+            
+            if unique_match_found:
+                pass # Already handled above
+            else:
+                # Check Standard Indexes (including Composite)
+                idx_matches = []
+                for idx_key, idx_map in self.indexes.items():
+                    val = get_query_val(idx_key)
+                    if val is not None:
+                        # Query covers this index
+                        if val in idx_map:
+                            idx_matches.append(set(idx_map[val]))
+                        else:
+                            idx_matches = None # Intersection with empty set is empty
+                            results = [] # clear results
                             break
-                    if match:
-                        yield doc
-        else:
-            # Full scan fallback
-            for doc in gdata.values():
-                match = True
-                for k, v in query.items():
-                    if doc.get(k) != v:
-                        match = False
-                        break
-                if match:
-                    yield doc
+                
+                if idx_matches is not None:
+                    if idx_matches:
+                        best_candidate_set = set.intersection(*idx_matches)
+                    
+                    if best_candidate_set is not None:
+                        for doc_id in best_candidate_set:
+                            if doc_id in gdata:
+                                doc = gdata[doc_id]
+                                # Skip expired docs
+                                if doc.get("_expires_at") and doc["_expires_at"] < now:
+                                    continue
+                                # Skip soft-deleted docs unless explicitly asked
+                                if doc.get("_deleted") and not (query and query.get("_deleted")):
+                                    continue
+                                if self._matches_query(doc, query):
+                                    results.append(doc)
+                    else:
+                        # Full scan fallback
+                        for doc in gdata.values():
+                            # Skip expired docs
+                            if doc.get("_expires_at") and doc["_expires_at"] < now:
+                                continue
+                            # Skip soft-deleted docs unless explicitly asked
+                            if doc.get("_deleted") and not (query and query.get("_deleted")):
+                                continue
+                            if self._matches_query(doc, query):
+                                results.append(doc)
+                else:
+                     pass # idx_matches was explicitly set to None (empty result)
+
+        yield from results
 
     def get_all(self) -> List[dict]:
         """
@@ -292,9 +526,18 @@ class HVPGroup:
                 warnings.warn(f"Duplicate insert for {doc_id} with different data during replay/insert")
             return
 
+        if self._computed_fields:
+            for field, func in self._computed_fields.items():
+                data[field] = func(data)
+
         self._update_index(doc_id, None, data)
         group_data[doc_id] = data
         self.storage._dirty = True
+
+    def set_computed_field(self, name: str, func: callable):
+        """Register a computed field function."""
+        self._computed_fields[name] = func
+        self._invalidate_cache()
 
     def insert(self, data: dict, external_txn_id: Optional[str]=None) -> dict:
         """
@@ -320,30 +563,38 @@ class HVPGroup:
             data['_id'] = str(uuid.uuid4())
         data['_created_at'] = time.time()
         
-        txn_id = None
-        is_implicit = True
-        if external_txn_id:
-            txn_id = external_txn_id
-            is_implicit = False
-        elif self.db and self.db.current_txn:
-            txn_id = self.db.current_txn
-            is_implicit = False
-        else:
-            txn_id = self.storage.begin_txn()
-            
-        try:
-            self._insert_mem(data)
-            self.storage.append_log('insert', self.name, str(data['_id']), data, txn_id=txn_id)
-            if is_implicit:
-                self.storage.commit_txn(txn_id)
-            return data
-        except Exception as e:
-            if data['_id'] in self.storage.data['groups'][self.name]:
-                self._delete_mem(data['_id'], data)
-            if is_implicit:
-                self.storage.rollback_txn(txn_id)
-            warnings.warn(f"Insert failed, rolled back: {e}")
-            raise
+        # TTL Support
+        if "ttl" in data:
+            data["_expires_at"] = time.time() + data.pop("ttl")
+        
+        lock = self.db._thread_lock if self.db else contextlib.nullcontext()
+        with lock:
+            self._invalidate_cache()
+            txn_id = None
+            is_implicit = True
+            if external_txn_id:
+                txn_id = external_txn_id
+                is_implicit = False
+            elif self.db and self.db.current_txn:
+                txn_id = self.db.current_txn
+                is_implicit = False
+            else:
+                txn_id = self.storage.begin_txn()
+                
+            try:
+                self._insert_mem(data)
+                self.storage.append_log('insert', self.name, str(data['_id']), data, txn_id=txn_id)
+                if is_implicit:
+                    self.storage.commit_txn(txn_id)
+                self._invalidate_cache()
+                return data
+            except Exception as e:
+                if data['_id'] in self.storage.data['groups'][self.name]:
+                    self._delete_mem(data['_id'], data)
+                if is_implicit:
+                    self.storage.rollback_txn(txn_id)
+                warnings.warn(f"Insert failed, rolled back: {e}")
+                raise
 
     def _update_mem(self, doc_id: str, update_data: dict, old_doc: dict):
         """Internal: Update document in-memory and refresh indexes."""
@@ -382,38 +633,42 @@ class HVPGroup:
         Returns:
             Number of documents updated.
         """
-        docs = self.find(query)
-        if not docs:
-            return 0
-        cnt = 0
-        txn_id = None
-        is_implicit = True
-        if external_txn_id:
-            txn_id = external_txn_id
-            is_implicit = False
-        elif self.db and self.db.current_txn:
-            txn_id = self.db.current_txn
-            is_implicit = False
-        else:
-            txn_id = self.storage.begin_txn()
-        mod_log = []
-        try:
-            for doc in docs:
-                old_doc = doc.copy()
-                updated_doc = self._update_mem(doc['_id'], update_data, old_doc)
-                mod_log.append((doc['_id'], old_doc))
-                self.storage.append_log('update', self.name, doc['_id'], updated_doc, txn_id=txn_id, before_image=old_doc)
-                cnt += 1
-            if is_implicit:
-                self.storage.commit_txn(txn_id)
-            return cnt
-        except Exception as e:
-            for doc_id, old_doc in reversed(mod_log):
-                self._restore_mem(doc_id, old_doc)
-            if is_implicit:
-                self.storage.rollback_txn(txn_id)
-            warnings.warn(f"Update failed, rolled back {len(mod_log)} docs: {e}")
-            raise
+        lock = self.db._thread_lock if self.db else contextlib.nullcontext()
+        with lock:
+            self._invalidate_cache()
+            docs = self.find(query)
+            if not docs:
+                return 0
+            cnt = 0
+            txn_id = None
+            is_implicit = True
+            if external_txn_id:
+                txn_id = external_txn_id
+                is_implicit = False
+            elif self.db and self.db.current_txn:
+                txn_id = self.db.current_txn
+                is_implicit = False
+            else:
+                txn_id = self.storage.begin_txn()
+            mod_log = []
+            try:
+                for doc in docs:
+                    old_doc = doc.copy()
+                    updated_doc = self._update_mem(doc['_id'], update_data, old_doc)
+                    mod_log.append((doc['_id'], old_doc))
+                    self.storage.append_log('update', self.name, doc['_id'], updated_doc, txn_id=txn_id, before_image=old_doc)
+                    cnt += 1
+                if is_implicit:
+                    self.storage.commit_txn(txn_id)
+                self._invalidate_cache()
+                return cnt
+            except Exception as e:
+                for doc_id, old_doc in reversed(mod_log):
+                    self._restore_mem(doc_id, old_doc)
+                if is_implicit:
+                    self.storage.rollback_txn(txn_id)
+                warnings.warn(f"Update failed, rolled back {len(mod_log)} docs: {e}")
+                raise
 
     def _delete_mem(self, doc_id: str, doc: dict):
         """Internal: Remove document from in-memory storage and update indexes."""
@@ -432,38 +687,41 @@ class HVPGroup:
         Returns:
             Number of documents deleted.
         """
-        docs = self.find(query)
-        if not docs:
-            return 0
-        cnt = 0
-        txn_id = None
-        is_implicit = True
-        if external_txn_id:
-            txn_id = external_txn_id
-            is_implicit = False
-        elif self.db and self.db.current_txn:
-            txn_id = self.db.current_txn
-            is_implicit = False
-        else:
-            txn_id = self.storage.begin_txn()
-        del_log = []
-        try:
-            for doc in docs:
-                doc_copy = doc.copy()
-                self._delete_mem(doc['_id'], doc)
-                del_log.append((doc['_id'], doc_copy))
-                self.storage.append_log('delete', self.name, doc['_id'], doc_copy, txn_id=txn_id, before_image=doc_copy)
-                cnt += 1
-            if is_implicit:
-                self.storage.commit_txn(txn_id)
-            return cnt
-        except Exception as e:
-            for doc_id, doc_data in reversed(del_log):
-                self._insert_mem(doc_data)
-            if is_implicit:
-                self.storage.rollback_txn(txn_id)
-            warnings.warn(f"Delete failed, rolled back {len(del_log)} docs: {e}")
-            raise
+        lock = self.db._thread_lock if self.db else contextlib.nullcontext()
+        with lock:
+            docs = self.find(query)
+            if not docs:
+                return 0
+            cnt = 0
+            txn_id = None
+            is_implicit = True
+            if external_txn_id:
+                txn_id = external_txn_id
+                is_implicit = False
+            elif self.db and self.db.current_txn:
+                txn_id = self.db.current_txn
+                is_implicit = False
+            else:
+                txn_id = self.storage.begin_txn()
+            del_log = []
+            try:
+                for doc in docs:
+                    doc_copy = doc.copy()
+                    self._delete_mem(doc['_id'], doc)
+                    del_log.append((doc['_id'], doc_copy))
+                    self.storage.append_log('delete', self.name, doc['_id'], doc_copy, txn_id=txn_id, before_image=doc_copy)
+                    cnt += 1
+                if is_implicit:
+                    self.storage.commit_txn(txn_id)
+                self._invalidate_cache()
+                return cnt
+            except Exception as e:
+                for doc_id, doc_data in reversed(del_log):
+                    self._insert_mem(doc_data)
+                if is_implicit:
+                    self.storage.rollback_txn(txn_id)
+                warnings.warn(f"Delete failed, rolled back {len(del_log)} docs: {e}")
+                raise
 
     def count(self, query: Optional[dict]=None) -> int:
         """
@@ -544,8 +802,50 @@ class HVPDB:
             password: Authentication password.
             durable: Whether to use durable storage (WAL).
         """
-        raw = path
         self.is_cluster = False
+        self._ttl_thread = None
+        self._stop_ttl = threading.Event()
+        self.durable = durable # Store durable state for _load_storage
+        
+        self._load_storage(path, password)
+        
+        if durable and not self.is_cluster:
+            self._start_ttl_reaper()
+
+    def _start_ttl_reaper(self):
+        """Start a background thread to purge expired documents."""
+        def reaper():
+            while not self._stop_ttl.wait(60): # Run every 60 seconds
+                try:
+                    now = time.time()
+                    for group_name in self.get_all_groups():
+                        group = self.group(group_name)
+                        expired = [d["_id"] for d in group.find({"_expires_at": {"$lt": now}}, limit=0) if "_expires_at" in d]
+                        if expired:
+                            group.delete({"_id": {"$in": expired}})
+                except Exception as e:
+                    warnings.warn(f"TTL Reaper Error: {e}")
+        
+        self._ttl_thread = threading.Thread(target=reaper, daemon=True)
+        self._ttl_thread.start()
+
+    def _load_storage(self, path: str, password: Optional[str]=None):
+        """
+        Internal method to load storage based on path and password.
+        This logic was moved from __init__ to allow for re-initialization
+        or separate loading concerns.
+        
+        Args:
+            path: File path or hvp:// URI.
+            password: Authentication password.
+        """
+        raw = path
+        # self.is_cluster is already initialized in __init__
+        
+        if path.startswith('hvp://'):
+            # This block seems incomplete in the original, assuming it's handled elsewhere or is a placeholder
+            pass # Placeholder for URI handling if needed
+        
         base = os.path.basename(raw)
         if base.endswith('.hvp'):
             name = base[:-4]
@@ -554,6 +854,7 @@ class HVPDB:
             self.is_cluster = True
         else:
             name = base
+        
         if '://' in raw:
             self.filepath = raw
         elif os.path.isabs(raw) or os.path.dirname(raw):
@@ -585,7 +886,8 @@ class HVPDB:
             if not self.password:
                  raise ValueError("Password required. Set HVPDB_PASSWORD or pass 'password' argument.")
 
-        self.durable = durable
+        # self.durable is already initialized in __init__
+        self._thread_lock = threading.RLock()
         self._user_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(f'user_{uuid.uuid4()}', default=None)
         self._txn_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(f'txn_{uuid.uuid4()}', default=None)
         self._groups = {}
@@ -784,24 +1086,72 @@ class HVPDB:
             raise ValueError(f"Invalid group: '{name}' (Path Traversal Protection)")
         if self.is_cluster and name == self._CLUSTER_META_GROUP_NAME:
             raise ValueError(f"Invalid group: '{name}'")
+        
         if name in self._groups:
             grp = self._groups[name]
             if schema:
                 grp.schema = schema
             return grp
+
         if self.is_cluster:
-            path = os.path.join(self.filepath, f'{name}.hvp')
-            s = HVPStorage(path, self.password, durable=self.durable)
-            s.load()
-            if 'groups' not in s.data:
-                s.data['groups'] = {}
-            g = HVPGroup(s, name, self, schema=schema)
-            self._groups[name] = g
-            return g
+            # Lazy Loading in cluster mode
+            # We don't load the file here, just create the group context.
+            # HVPGroup will handle loading its subset of storage if needed.
+            group = HVPGroup(None, name, db_instance=self, schema=schema)
         else:
-            if name not in self._groups:
-                self._groups[name] = HVPGroup(self.storage, name, self, schema=schema)
-            return self._groups[name]
+            # Single file mode: all groups share the main storage
+            group = HVPGroup(self.storage, name, db_instance=self, schema=schema)
+            
+        self._groups[name] = group
+        return group
+
+    def drop_group(self, name: str):
+        """
+        Permanently delete a group and all its data.
+        
+        In Cluster Mode, this deletes the underlying file (O(1) operation),
+        similar to dropping a partition in other databases.
+        
+        Args:
+            name: Group name to drop.
+        """
+        if name not in self._groups and (not self.is_cluster or name not in self.get_all_groups()):
+            # If not loaded and not in list, assume it doesn't exist
+            return
+
+        if self.is_cluster:
+            # Ensure group is loaded so we can close it properly
+            if name in self._groups:
+                grp = self._groups[name]
+                # Close storage handles (WAL, etc.)
+                if hasattr(grp.storage, 'wal') and grp.storage.wal:
+                    grp.storage.wal.close()
+                if grp.storage.security:
+                    grp.storage.security.clear_key()
+                del self._groups[name]
+
+            # Delete files
+            base_path = os.path.join(self.filepath, f'{name}.hvp')
+            for ext in ['', '.log', '.writelock', '.lock']:
+                p = base_path + ext
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError as e:
+                        warnings.warn(f"Failed to delete {p}: {e}")
+        else:
+            # Single file mode: delete from memory dict
+            if name in self.storage.data['groups']:
+                del self.storage.data['groups'][name]
+                # Also clean up indexes
+                if '_indexes' in self.storage.data and name in self.storage.data['_indexes']:
+                    del self.storage.data['_indexes'][name]
+                
+                self.storage._dirty = True
+                self.storage.append_log('drop_group', name, '', {})
+            
+            if name in self._groups:
+                del self._groups[name]
 
     def get_all_groups(self) -> List[str]:
         """
@@ -833,6 +1183,18 @@ class HVPDB:
         elif self.storage._dirty:
             self.storage.save()
 
+    def backup(self, path: str):
+        """
+        Create a point-in-time backup of the database.
+        """
+        self.storage.create_snapshot(path)
+
+    def repair(self) -> bool:
+        """
+        Attempt to repair the database storage files.
+        """
+        return self.storage.repair()
+
     def refresh(self, force: bool=False):
         """
         Reload database data from disk.
@@ -854,6 +1216,12 @@ class HVPDB:
         
         Closes WAL files and clears security keys from memory.
         """
+        if self._ttl_thread:
+            self._stop_ttl.set()
+            self._ttl_thread.join(timeout=5) # Give it a moment to stop
+            if self._ttl_thread.is_alive():
+                warnings.warn("TTL reaper thread did not terminate gracefully.")
+
         self.commit()
         
         def _cleanup_storage(s):

@@ -1,8 +1,17 @@
+# ============================================
+# HVPDB .gitignore
+# ============================================
+
+# ---- Python ----
 __pycache__/
 *.pyc
+*.pyo
 *.egg-info/
 dist/
 build/
+*.egg
+
+# ---- Testing & Linting ----
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -10,30 +19,81 @@ build/
 .coverage
 coverage.xml
 htmlcov/
+
+# ---- Virtual Environments ----
 .venv/
 venv/
 env/
+
+# ---- IDE ----
 .idea/
 .vscode/
-backups/
-hvp/
-*.log
-*.hvp
-*.hvdb
-*.lock
-*.writelock
-*.zip
-*.hvpz
-users_dump.json
+
+# ---- OS Artifacts ----
+Thumbs.db
+.DS_Store
+
+# ---- Environment & Secrets ----
 .env
 .env.*
 *.pem
 *.key
 *.p12
 *.pfx
-Thumbs.db
-.DS_Store
-# Ignore plugin directories as they are separate repos
+runtime_pass.txt
+hvpdb_passkeys.json
+hvpdb_passkeys.json.key
+
+# ---- Database Runtime Files ----
+*.hvp
+*.hvdb
+*.log
+*.lock
+*.writelock
+*.hvpz
+*.zip
+hvp/
+backups/
+users_dump.json
+
+# ---- Test Artifacts ----
+test_db_verification*
+verify_fixes*
+stress_test_db*
+stability_test_db*
+my_cluster*
+test_architecture*
+test_cluster*
+
+# ---- Temp Scripts (not part of core) ----
+gitbook_tool.py
+gitbook_probe.py
+demo_passkey.py
+verify_partition_drop.py
+verify_fixes.py
+verify_process_stale.py
+run_ci.py
+
+# ---- Draft Documentation (replaced by hvpdb_definitive_reference.md) ----
+docs_intro.md
+docs_core.md
+docs_concurrency.md
+docs_release_notes.md
+docs_python_api.md
+docs_cli_shell.md
+docs_security_advanced.md
+docs_operations.md
+
+# ---- Internal Notes (not for public repo) ----
+TODO.md
+WORKSPACE.md
+WSPCLONE.md
+TEST_PASSKEY.md
+claude.txt
+claude.md
+release_note.md
+
+# ---- Plugin Directories (separate repos) ----
 hvpdb-admin/
 hvpdb-backup/
 hvpdb-http/
@@ -43,28 +103,17 @@ hvpdb-perms/
 hvpdb-query/
 hvpdb-sync/
 hvpdb-tools/
-TODO.md
-test_schema.py
-WSPCLONE.md
-tests/
-claude.txt
-claude.md
-CHANGELOG.md
-release_note.md
-WORKSPACE.md
 
-# Test Artifacts
-test_db_verification*
-verify_fixes*
-stress_test_db*
-stability_test_db*
-my_cluster*
-test_architecture*
-test_cluster*
-
-# Sensitive & Runtime Files
-hvpdb_passkeys.json
-hvpdb_passkeys.json.key
-runtime_pass.txt
-TEST_PASSKEY.md
-verify_fixes.py
+# ---- Keep These (tracked files) ----
+# README.md
+# CHANGELOG.md
+# LICENSE
+# TRADEMARK.md
+# MANIFEST.in
+# setup.py
+# requirements.txt
+# pyrightconfig.json
+# hvpdb_definitive_reference.md   <-- Main documentation
+# hvpdb/                           <-- Core source
+# tests/                           <-- Test suite
+# .github/                         <-- CI/CD

@@ -16,7 +16,8 @@ from .wal import HVPWAL
 from .utils import acquire_interruptible_lock, default_serializer
 
 HEADER = b'HVPDB'
-VERSION = 2
+VERSION = 3
+COMPRESSION_ZSTD = 1
 
 class HVPStorage:
     """
@@ -88,6 +89,9 @@ class HVPStorage:
         
         # Auto-Checkpoint Config
         self.wal_checkpoint_threshold = 10 * 1024 * 1024  # 10 MB
+        self._last_mtime = 0.0
+        self.compression_level = 3
+        self.compression_type = COMPRESSION_ZSTD
 
     def _init_security(self, salt: Optional[bytes]=None, kdf_params: Optional[dict]=None):
         """
@@ -114,6 +118,27 @@ class HVPStorage:
         if self._dirty and (not force):
             raise RuntimeError('Cannot refresh with unsaved changes.')
         self.load()
+
+    def _update_mtime(self):
+        """Update the last modified time from the file system."""
+        if os.path.exists(self.filepath):
+            try:
+                self._last_mtime = os.path.getmtime(self.filepath)
+            except OSError:
+                pass
+
+    def check_reload(self):
+        """Check if the file has changed on disk and reload if necessary."""
+        if not os.path.exists(self.filepath):
+            return
+        try:
+            current_mtime = os.path.getmtime(self.filepath)
+            if current_mtime > self._last_mtime:
+                # File has changed, reload
+                # Note: We rely on load() to acquire the reader lock
+                self.load()
+        except OSError:
+            pass
 
     def load(self):
         """
@@ -145,17 +170,27 @@ class HVPStorage:
                             self._init_security(salt)
                             assert self.security is not None
                             compressed_data = self.security.decrypt(nonce, ciphertext)
-                        elif version == 2:
+                        elif version >= 2:
                             salt = f.read(16)
                             kdf_len = int.from_bytes(f.read(2), 'big')
                             kdf_bytes = f.read(kdf_len)
                             kdf_params = msgpack.unpackb(kdf_bytes)
+                            
+                            comp_type = COMPRESSION_ZSTD
+                            if version >= 3:
+                                comp_type = int.from_bytes(f.read(1), 'big')
+                                
                             nonce = f.read(12)
                             ciphertext = f.read()
                             self._init_security(salt, kdf_params)
                             assert self.security is not None
-                            aad = HEADER + version.to_bytes(2, 'big') + salt + kdf_len.to_bytes(2, 'big') + kdf_bytes
-                            compressed_data = self.security.decrypt(nonce, ciphertext, associated_data=aad)
+                            
+                            # Build AAD
+                            prefix = HEADER + version.to_bytes(2, 'big') + salt + kdf_len.to_bytes(2, 'big') + kdf_bytes
+                            if version >= 3:
+                                prefix += comp_type.to_bytes(1, 'big')
+                            
+                            compressed_data = self.security.decrypt(nonce, ciphertext, associated_data=prefix)
                         else:
                             raise ValueError(f'Unsupported Version: {version}')
                         packed_data = self.dctx.decompress(compressed_data)
@@ -163,6 +198,7 @@ class HVPStorage:
                         self._last_sequence = self.data.get('seq', 0)
                     except Exception as e:
                         raise ValueError(f'Decryption Failed: {e}')
+                self._update_mtime()
         self._replay_wal()
 
     def _replay_wal(self):
@@ -222,6 +258,33 @@ class HVPStorage:
             self.wal.truncate()
         print("[CHECKPOINT] Checkpoint completed successfully.")
 
+    def create_snapshot(self, snapshot_path: str):
+        """
+        Create a point-in-time snapshot of the database.
+        """
+        if not snapshot_path.endswith('.hvp'):
+            snapshot_path += '.hvp'
+            
+        with self.lock_manager.reader_lock():
+            if os.path.exists(self.filepath):
+                shutil.copy2(self.filepath, snapshot_path)
+
+    def repair(self):
+        """
+        Attempt to repair corrupted storage or WAL.
+        """
+        with self.lock_manager.writer_lock():
+            print("[REPAIR] Attempting database repair...")
+            try:
+                self.load() 
+                self._save_internal()
+                self.wal.truncate()
+                print("[REPAIR] Repair completed successfully.")
+                return True
+            except Exception as e:
+                print(f"[REPAIR] Repair failed: {e}")
+                return False
+
     def _save_internal(self):
         """Internal save implementation. Expects writer lock to be held."""
         self._init_security()
@@ -234,7 +297,7 @@ class HVPStorage:
         kdf_params = self.security.get_kdf_params()
         kdf_bytes = cast(bytes, msgpack.packb(kdf_params))
         kdf_len = len(kdf_bytes)
-        aad = HEADER + VERSION.to_bytes(2, 'big') + salt + kdf_len.to_bytes(2, 'big') + kdf_bytes
+        aad = HEADER + VERSION.to_bytes(2, 'big') + salt + kdf_len.to_bytes(2, 'big') + kdf_bytes + self.compression_type.to_bytes(1, 'big')
         nonce, ciphertext = self.security.encrypt(compressed_data, associated_data=aad)
         temp_path = self.filepath + '.tmp'
         try:
@@ -259,6 +322,7 @@ class HVPStorage:
                 f.write(salt)
                 f.write(kdf_len.to_bytes(2, 'big'))
                 f.write(kdf_bytes)
+                f.write(self.compression_type.to_bytes(1, 'big'))
                 f.write(nonce)
                 f.write(ciphertext)
                 f.flush()  # Ensure data is pushed to OS buffer
@@ -269,10 +333,15 @@ class HVPStorage:
                 except OSError:
                     pass
         with self.lock_manager.critical_swap_lock():
-            retries = 5
+            retries = 20
             while retries > 0:
                 try:
-                    os.replace(temp_path, self.filepath)
+                    if hasattr(os, 'replace'):
+                        os.replace(temp_path, self.filepath)
+                    else:
+                        if os.path.exists(self.filepath):
+                            os.remove(self.filepath)
+                        os.rename(temp_path, self.filepath)
                     
                     # Write Barrier: Ensure directory metadata entry is persisted
                     # This guarantees the file replacement is atomic and durable
@@ -287,6 +356,7 @@ class HVPStorage:
                             # Directory fsync might not be supported on all platforms/filesystems
                             pass
                     
+                    self._update_mtime()
                     break
                 except OSError as e:
                     # Handle Termux/FUSE limitations (ENOSYS/EPERM/EXDEV)
