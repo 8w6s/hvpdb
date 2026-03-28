@@ -3,6 +3,7 @@ import os
 import shutil
 import time
 import warnings
+import uuid
 from typing import Any, Dict, Optional, cast
 
 import msgpack
@@ -27,7 +28,7 @@ class HVPStorage:
     thread-safe access via lock management.
     """
 
-    def __init__(self, filepath_or_uri: str, password: Optional[str]=None, durable: bool=True):
+    def __init__(self, filepath_or_uri: str, password: Optional[str]=None, durable: bool=True, wal_checksum_type: int=0):
         """
         Initialize the storage engine.
         
@@ -35,11 +36,13 @@ class HVPStorage:
             filepath_or_uri: Path to the database file or cluster URI.
             password: Password for encryption/authentication.
             durable: If True, uses WAL for crash consistency.
+            wal_checksum_type: 0 for CRC32, 1 for SHA-256.
         """
         self.connection_info = None
         self.filepath = ''
         self.password = password
         self.durable = durable
+        self.wal_checksum_type = wal_checksum_type
         
         if filepath_or_uri.startswith('hvp://'):
             self.connection_info = HVPURI.parse(filepath_or_uri)
@@ -67,13 +70,11 @@ class HVPStorage:
                 pass
         
         self.log_path = self.filepath + '.log'
-        # Initialize WAL log file
-        if not os.path.exists(self.log_path):
-            with open(self.log_path, 'wb'):
-                pass
+        # Do not pre-create log file here, let HVPWAL handle it atomically via ensure_header
         
         try:
-            os.chmod(self.log_path, 0o600) # Only owner can read/write
+            if os.path.exists(self.log_path):
+                os.chmod(self.log_path, 0o600) # Only owner can read/write
         except OSError:
             pass
 
@@ -83,13 +84,21 @@ class HVPStorage:
         self._last_sequence = 0
         self.cctx = zstd.ZstdCompressor(level=3)
         self.dctx = zstd.ZstdDecompressor()
-        self.wal = HVPWAL(self.log_path, self.security)
+        self._defunct = False
+        self.wal = HVPWAL(self.log_path, self.security, checksum_type=wal_checksum_type)
         self.lock_manager = HVPLockManager(self.filepath)
         self._txn_buffers = {}
         
         # Auto-Checkpoint Config
         self.wal_checkpoint_threshold = 10 * 1024 * 1024  # 10 MB
-        self._last_mtime = 0.0
+        self._last_mtime_ns = 0
+        self._last_size = 0
+        self._last_ino = 0
+        self._last_log_mtime_ns = 0
+        self._last_log_size = 0
+        self._last_log_ino = 0
+        self._session_id = os.urandom(4).hex() # Phase 13: Unique ID for this writer session
+        self.on_reload = []
         self.compression_level = 3
         self.compression_type = COMPRESSION_ZSTD
 
@@ -104,6 +113,12 @@ class HVPStorage:
         if not self.security:
             if self.password is None:
                 raise ValueError("Password required for security initialization")
+            
+            # Atomic header check/init
+            salt_from_wal, kdf_from_wal, _ = HVPWAL.read_header(self.log_path)
+            if salt_from_wal:
+                salt, kdf_params = salt_from_wal, kdf_from_wal
+                
             self.security = HVPSecurity(self.password, salt, kdf_params)
             self.wal.security = self.security
             self.wal.ensure_header(self.security.get_salt(), self.security.get_kdf_params())
@@ -119,26 +134,72 @@ class HVPStorage:
             raise RuntimeError('Cannot refresh with unsaved changes.')
         self.load()
 
-    def _update_mtime(self):
-        """Update the last modified time from the file system."""
+    def _update_file_stats(self):
+        """Update file stats (mtime_ns, size, inode) for change detection."""
         if os.path.exists(self.filepath):
             try:
-                self._last_mtime = os.path.getmtime(self.filepath)
+                st = os.stat(self.filepath)
+                self._last_mtime_ns = st.st_mtime_ns
+                self._last_size = st.st_size
+                self._last_ino = st.st_ino
             except OSError:
                 pass
+        
+        if os.path.exists(self.log_path):
+            try:
+                st = os.stat(self.log_path)
+                self._last_log_mtime_ns = st.st_mtime_ns
+                self._last_log_size = st.st_size
+                self._last_log_ino = st.st_ino
+            except OSError:
+                pass
+        else:
+            self._last_log_mtime_ns = 0
+            self._last_log_size = 0
+            self._last_log_ino = 0
+            self._last_log_mtime = 0
+            self._last_log_size = 0
 
     def check_reload(self):
-        """Check if the file has changed on disk and reload if necessary."""
+        """Check for disk changes using mtime_ns, size, and inode."""
         if not os.path.exists(self.filepath):
+            if self._last_mtime_ns != 0 and not self._defunct and not os.path.exists(self.log_path):
+                # Group was dropped by another process
+                self._defunct = True
+                self.data['groups'] = {}
+                for callback in self.on_reload:
+                    try: callback()
+                    except: pass
             return
+        
         try:
-            current_mtime = os.path.getmtime(self.filepath)
-            if current_mtime > self._last_mtime:
-                # File has changed, reload
-                # Note: We rely on load() to acquire the reader lock
+            st = os.stat(self.filepath)
+            log_st = os.stat(self.log_path) if os.path.exists(self.log_path) else None
+            
+            changed = (st.st_mtime_ns != self._last_mtime_ns or 
+                       st.st_size != self._last_size or 
+                       st.st_ino != self._last_ino)
+            
+            if not changed and log_st:
+                changed = (log_st.st_mtime_ns != self._last_log_mtime_ns or 
+                           log_st.st_size != self._last_log_size or 
+                           log_st.st_ino != self._last_log_ino)
+            
+            if changed:
                 self.load()
         except OSError:
             pass
+
+    def register_reload_callback(self, callback):
+        """Register a function to be called after a successful reload/WAL replay."""
+        self.on_reload.append(callback)
+
+    def unregister_reload_callback(self, callback):
+        """Unregister a reload callback (prevents memory leaks when objects are deleted)."""
+        try:
+            self.on_reload.remove(callback)
+        except ValueError:
+            pass  # Callback was not registered
 
     def load(self):
         """
@@ -147,11 +208,13 @@ class HVPStorage:
         This method uses a reader lock to ensure thread-safe access and 
         replays the WAL to apply any pending operations.
         """
-        with self.lock_manager.reader_lock():
+        with self.lock_manager.writer_lock():
+            if self._defunct:
+                 raise OSError(f"Database file {self.filepath} has been deleted/defunct.")
             if not os.path.exists(self.filepath):
                 self.data = {'groups': {}}
                 self._last_sequence = 0
-                salt, kdf_params = HVPWAL.read_header(self.log_path)
+                salt, kdf_params, _ = HVPWAL.read_header(self.log_path)
                 if salt:
                     self._init_security(salt, kdf_params)
                 else:
@@ -198,8 +261,16 @@ class HVPStorage:
                         self._last_sequence = self.data.get('seq', 0)
                     except Exception as e:
                         raise ValueError(f'Decryption Failed: {e}')
-                self._update_mtime()
+            # Always update stats even if file didn't exist (might have WAL)
+            self._update_file_stats()
         self._replay_wal()
+        
+        # Notify listeners that data has been updated
+        for callback in self.on_reload:
+            try:
+                callback()
+            except Exception as e:
+                warnings.warn(f"Reload callback failed: {e}")
 
     def _replay_wal(self):
         """
@@ -220,21 +291,36 @@ class HVPStorage:
             entry: The WAL log entry to apply.
         """
         entry_type = entry.get('type', 'DATA')
-        if entry_type not in ('DATA', 'legacy'):
+        if entry_type not in ('DATA', 'legacy', 'drop_group'):
             return
         op = entry.get('op')
         group_name = entry.get('g')
         doc_id = entry.get('id')
         data = entry.get('d')
         seq = entry.get('seq', 0)
-        if seq > self._last_sequence:
-            self._last_sequence = seq
-        if not group_name:
+        if seq <= self._last_sequence and seq != 0:
             return
+        self._last_sequence = seq
+
+        if op == 'drop_group' or entry_type == 'drop_group':
+            if group_name in self.data['groups']:
+                del self.data['groups'][group_name]
+            return
+        if group_name == 'kv':
+            if 'kv' not in self.data:
+                self.data['kv'] = {}
+            if op == 'set':
+                self.data['kv'][doc_id] = data.get('value') if isinstance(data, dict) else data
+            elif op == 'delete':
+                if doc_id in self.data['kv']:
+                    del self.data['kv'][doc_id]
+            return
+
         if group_name not in self.data['groups']:
             self.data['groups'][group_name] = {}
         group_data = self.data['groups'][group_name]
-        if op == 'insert' or op == 'update':
+        
+        if op == 'insert' or op == 'update' or op == 'set':
             if doc_id and data:
                 group_data[doc_id] = data
         elif op == 'delete':
@@ -245,6 +331,8 @@ class HVPStorage:
 
     def save(self):
         """Compress, encrypt, and atomically save the database to disk (Manual trigger)."""
+        if self._defunct:
+            raise OSError(f"Cannot save: Database file {self.filepath} has been deleted/defunct.")
         self.checkpoint()
 
     def checkpoint(self):
@@ -252,24 +340,26 @@ class HVPStorage:
         Perform a full checkpoint: Serialize memory -> Disk, Truncate WAL.
         Acquires writer_lock to ensure exclusivity.
         """
-        print("[CHECKPOINT] Starting checkpoint operation...")
+        if self._defunct:
+            raise OSError(f"Cannot checkpoint: Database file {self.filepath} has been deleted/defunct.")
         with self.lock_manager.writer_lock():
-            self._save_internal()
-            self.wal.truncate()
-        print("[CHECKPOINT] Checkpoint completed successfully.")
+            # Hold WAL lock during the entire checkpoint to prevent 
+            # concurrent writes from being lost during truncate.
+            with self.wal.exclusive_lock():
+                print(f"DEBUG: STG performing checkpoint (truncating WAL) for {self.filepath}")
+                self._save_internal()
 
     def create_snapshot(self, snapshot_path: str):
         """
         Create a point-in-time snapshot of the database.
+        Wraps both save and copy in a single writer lock to prevent TOCTOU.
         """
         if not snapshot_path.endswith('.hvp'):
             snapshot_path += '.hvp'
             
-        # Force checkpoint to ensure .hvp file is up-to-date and exists
-        # This flushes WAL and memory to the main file.
-        self.checkpoint()
-
-        with self.lock_manager.reader_lock():
+        with self.lock_manager.writer_lock():
+            # Flush memory to main file
+            self._save_internal()
             if os.path.exists(self.filepath):
                 shutil.copy2(self.filepath, snapshot_path)
 
@@ -349,7 +439,7 @@ class HVPStorage:
                     
                     # Write Barrier: Ensure directory metadata entry is persisted
                     # This guarantees the file replacement is atomic and durable
-                    if hasattr(os, 'open') and hasattr(os, 'fsync'):
+                    if os.name != 'nt' and hasattr(os, 'open') and hasattr(os, 'fsync'):
                         try:
                             dir_fd = os.open(os.path.dirname(os.path.abspath(self.filepath)), os.O_RDONLY)
                             try:
@@ -357,10 +447,9 @@ class HVPStorage:
                             finally:
                                 os.close(dir_fd)
                         except (OSError, ValueError):
-                            # Directory fsync might not be supported on all platforms/filesystems
                             pass
                     
-                    self._update_mtime()
+                    self._update_file_stats()
                     break
                 except OSError as e:
                     # Handle Termux/FUSE limitations (ENOSYS/EPERM/EXDEV)
@@ -392,9 +481,11 @@ class HVPStorage:
         
         # Check WAL size for auto-checkpoint
         try:
-            if os.path.exists(self.log_path) and os.path.getsize(self.log_path) > self.wal_checkpoint_threshold:
-                print(f"[AUTO-CHECKPOINT] WAL size {os.path.getsize(self.log_path)} exceeds threshold {self.wal_checkpoint_threshold}. Triggering checkpoint.")
-                self.checkpoint()
+            if os.path.exists(self.log_path):
+                sz = os.path.getsize(self.log_path)
+                if sz > self.wal_checkpoint_threshold:
+                    print(f"DEBUG: STG auto-checkpoint triggered (size {sz} > threshold {self.wal_checkpoint_threshold})")
+                    self.checkpoint()
         except OSError:
             pass
 
@@ -413,35 +504,38 @@ class HVPStorage:
     def begin_txn(self) -> str:
         """
         Start a new transaction and return its ID.
-        
-        Returns:
-            The unique transaction ID.
         """
-        txn_id = self.wal.begin_transaction()
         self._init_security()
-        self._last_sequence += 1
-        self._txn_buffers[txn_id] = []
-        entry = {'seq': self._last_sequence, 'txn': txn_id, 'type': 'BEGIN', 'ts': time.time()}
-        self._txn_buffers[txn_id].append(entry)
-        return txn_id
+        
+        # Phase 13: Hold exclusive lock for atomic sequence increment
+        with self.wal.exclusive_lock():
+            self.check_reload()
+            txn_id = self.wal.begin_transaction()
+            self._last_sequence += 1
+            self._txn_buffers[txn_id] = []
+            print(f"DEBUG: Storage begin_txn {txn_id}, last_seq {self._last_sequence}")
+            entry = {'seq': self._last_sequence, 'sid': self._session_id, 'txn': txn_id, 'type': 'BEGIN', 'ts': time.time()}
+            self._txn_buffers[txn_id].append(entry)
+            return txn_id
 
     def commit_txn(self, txn_id: str, check_auto_checkpoint: bool = True):
         """
         Commit a transaction and sync its operations to the WAL.
-        
-        Args:
-            txn_id: The ID of the transaction to commit.
-            check_auto_checkpoint: Whether to check/trigger auto-checkpoint.
         """
         self._init_security()
-        self._last_sequence += 1
-        entry = {'seq': self._last_sequence, 'txn': txn_id, 'type': 'COMMIT', 'ts': time.time()}
-        if txn_id in self._txn_buffers:
-            self._txn_buffers[txn_id].append(entry)
-            self.wal.write_batch(self._txn_buffers[txn_id], sync=self.durable)
-            del self._txn_buffers[txn_id]
-        else:
-            self.wal.log_commit(self._last_sequence, txn_id)
+        
+        # Phase 13: Hold exclusive lock for atomic sequence increment
+        with self.wal.exclusive_lock():
+            self.check_reload()
+            self._last_sequence += 1
+            entry = {'seq': self._last_sequence, 'sid': self._session_id, 'txn': txn_id, 'type': 'COMMIT', 'ts': time.time()}
+            
+            if txn_id in self._txn_buffers:
+                self._txn_buffers[txn_id].append(entry)
+                self.wal.write_batch(self._txn_buffers[txn_id], sync=self.durable)
+                del self._txn_buffers[txn_id]
+            else:
+                self.wal.log_commit(self._last_sequence, txn_id, sid=self._session_id)
             
         # Trigger auto-checkpoint check after transaction commit
         if check_auto_checkpoint:
@@ -449,73 +543,73 @@ class HVPStorage:
 
     def rollback_txn(self, txn_id: str):
         """
-        Roll back a transaction, restore RAM state, and discard its operations.
-        
-        Args:
-            txn_id: The ID of the transaction to roll back.
+        Roll back a transaction.
         """
         self._init_security()
-        self._last_sequence += 1
         
-        # Restore RAM state from buffer
-        if txn_id in self._txn_buffers:
-            # Iterate backwards to undo changes
-            for entry in reversed(self._txn_buffers[txn_id]):
-                if entry.get('type') != 'DATA':
-                    continue
+        # Phase 13: Hold exclusive lock for atomic sequence increment
+        with self.wal.exclusive_lock():
+            self.check_reload()
+            self._last_sequence += 1
+            
+            # Restore RAM state from buffer
+            if txn_id in self._txn_buffers:
+                # Iterate backwards to undo changes
+                for entry in reversed(self._txn_buffers[txn_id]):
+                    if entry.get('type') != 'DATA':
+                        continue
                 
-                op = entry.get('op')
-                group_name = entry.get('g')
-                doc_id = entry.get('id')
-                before_image = entry.get('b')
-                
-                if not group_name or not doc_id:
-                    continue
+                    op = entry.get('op')
+                    group_name = entry.get('g')
+                    doc_id = entry.get('id')
+                    before_image = entry.get('b')
                     
-                if group_name not in self.data['groups']:
-                    continue
+                    if not group_name or not doc_id:
+                        continue
+                        
+                    if group_name not in self.data['groups']:
+                        continue
+                        
+                    group_data = self.data['groups'][group_name]
                     
-                group_data = self.data['groups'][group_name]
-                
-                # Undo based on operation
-                if op == 'insert':
-                    # Undo insert = delete
-                    if doc_id in group_data:
-                        del group_data[doc_id]
-                elif op == 'update':
-                    # Undo update = restore before_image
-                    if before_image:
-                        group_data[doc_id] = before_image
-                elif op == 'delete':
-                    # Undo delete = insert before_image
-                    if before_image:
-                        group_data[doc_id] = before_image
+                    # Undo based on operation
+                    if op == 'insert':
+                        # Undo insert = delete
+                        if doc_id in group_data:
+                            del group_data[doc_id]
+                    elif op == 'update':
+                        # Undo update = restore before_image
+                        if before_image:
+                            group_data[doc_id] = before_image
+                    elif op == 'delete':
+                        # Undo delete = insert before_image
+                        if before_image:
+                            group_data[doc_id] = before_image
             
             # Clear buffer
-            del self._txn_buffers[txn_id]
+            if txn_id in self._txn_buffers:
+                del self._txn_buffers[txn_id]
             self._dirty = True # Mark dirty because we modified RAM (reverted)
             
-        self.wal.log_rollback(self._last_sequence, txn_id)
+            self.wal.log_rollback(self._last_sequence, txn_id, sid=self._session_id)
 
     def append_log(self, op: str, group_name: str, doc_id: str, data: dict, txn_id: Optional[str]=None, before_image: Optional[dict]=None):
         """
         Append an operation to the WAL.
-        
-        Args:
-            op: Operation type ('insert', 'update', 'delete').
-            group_name: Name of the data group.
-            doc_id: ID of the affected document.
-            data: New document data.
-            txn_id: Optional transaction ID.
-            before_image: Optional document state before the operation.
         """
         self._init_security()
-        self._last_sequence += 1
-        entry = {'seq': self._last_sequence, 'txn': txn_id, 'type': 'DATA', 'op': op, 'g': group_name, 'id': doc_id, 'd': data, 'b': before_image, 'ts': time.time()}
-        if txn_id and txn_id in self._txn_buffers:
-            self._txn_buffers[txn_id].append(entry)
-        else:
-            self.wal.append(self._last_sequence, op, group_name, doc_id, data, txn_id, before_image, sync=self.durable)
+        
+        # Phase 13: Hold exclusive lock to ensure atomic sequence increment 
+        # and prevent collisions between processes.
+        with self.wal.exclusive_lock():
+            self.check_reload()
+            self._last_sequence += 1
+            entry = {'seq': self._last_sequence, 'sid': self._session_id, 'txn': txn_id, 'type': 'DATA', 'op': op, 'g': group_name, 'id': doc_id, 'd': data, 'b': before_image, 'ts': time.time()}
+            
+            if txn_id and txn_id in self._txn_buffers:
+                self._txn_buffers[txn_id].append(entry)
+            else:
+                self.wal.append(self._last_sequence, op, group_name, doc_id, data, txn_id, before_image, sync=self.durable, sid=self._session_id)
 
     def append_batch_log(self, operations: list, txn_id: Optional[str]=None):
         """
@@ -554,10 +648,30 @@ class HVPStorage:
             List of audit log entries.
         """
         results = []
-
+        # Strategy: Scan backwards to quickly find matching entries for the group/doc
+        # We scan more than 'limit' in WAL since some might not match the filters
+        scan_limit = limit * 10 if group_name else limit
+        
+        try:
+            raw_entries = self.wal.replay_reverse(scan_limit)
+            for entry in raw_entries:
+                if not group_name or entry.get('g') == group_name:
+                    if doc_id is None or entry.get('id') == doc_id:
+                        results.append(entry)
+                        if len(results) >= limit:
+                            break
+            if results:
+                return results
+        except Exception:
+             pass # Fallback to standard replay
+             
+        from collections import deque
+        results_q = deque(maxlen=limit)
         def collector(entry):
-            if entry.get('g') == group_name:
+            if not group_name or entry.get('g') == group_name:
                 if doc_id is None or entry.get('id') == doc_id:
-                    results.append(entry)
+                    results_q.append(entry)
         self.wal.replay(0, collector)
-        return sorted(results, key=lambda x: x.get('ts', 0), reverse=True)[:limit]
+        res = list(results_q)
+        res.reverse()
+        return res

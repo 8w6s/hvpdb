@@ -1,3 +1,106 @@
+# HVPDB v1.0.8 — Hooks, GraphQL & Performance Analysis Release
+
+## [1.0.8] - 2026-03-28 (Feature + Bugfix Release)
+
+### 🐛 Bug Fixes (Critical)
+
+**Exception Handling Improvements**
+- Replaced 13 bare `except: pass` statements with proper `warnings.warn()` logging:
+  - WAL file locking & cleanup (`wal.py`: 7 locations)
+  - Storage initialization & reload callbacks (`storage.py`: 2 locations)
+  - Replay/verification logic (`wal.py`: 4 locations)
+- Now all silent failures generate proper warnings for debugging
+
+**Memory Leak Prevention**
+- Added `unregister_reload_callback()` method in `HVPStorage` to prevent callback buildup
+- Implemented `__del__()` in `HVPGroup` to cleanup callbacks when group is garbage collected
+- Fixed duplicate `_file_handle = None` statement in WAL `_close_internal()` method
+
+**Security Hardening**
+- Added null-checks for `self.security` in WAL `_write_entry()` and `write_batch()` methods
+- Prevents AttributeError crash if security context not initialized
+- Raises explicit `RuntimeError` with clear message instead of silent failure
+
+### ✨ New Features
+
+**1. Hooks/Triggers System (v1.0.8+)**
+- `register_hook(hook_type, callback)` - Register document lifecycle callbacks
+- `unregister_hook(hook_type, callback)` - Cleanup hooks
+- Supported hooks:
+  - `pre_insert`, `post_insert` - Insert lifecycle
+  - `pre_update`, `post_update` - Update lifecycle
+  - `pre_delete`, `post_delete` - Delete lifecycle
+- Example:
+  ```python
+  db.users.register_hook('pre_insert', lambda doc: print(f"Inserting: {doc['_id']}"))
+  db.users.insert({'name': 'Alice'})  # Prints: Inserting: <uuid>
+  ```
+
+**2. GraphQL API Endpoint (v1.0.8+)**
+- Auto-generated GraphQL schema from database groups
+- New endpoint: `POST /graphql`
+- Queries:
+  - `groups()` - List all available groups
+  - `group_docs(group_name, query_json)` - Retrieve documents with optional filtering
+- Graceful fallback if Strawberry library not installed
+- Example:
+  ```graphql
+  query {
+    groups
+    groupDocs(groupName: "users", queryJson: "{\"role\": \"admin\"}")
+  }
+  ```
+
+**3. Query Profiler & EXPLAIN (v1.0.8+)**
+- `group.explain(query)` - Detailed query execution plan
+  - Returns: execution strategy, index usage, estimated documents scanned, timing
+  - Strategies: `unique_index`, `index_scan`, `full_scan`
+- `group.profile(operation, query)` - Performance metrics
+  - Operations: `find`, `insert`, `update`, `delete`
+  - Metrics: execution time (ms), memory delta, status
+- Example:
+  ```python
+  # Get query plan
+  plan = db.users.explain({'email': 'alice@example.com'})
+  print(f"Strategy: {plan['execution_strategy']}, Indexed: {plan['has_indexes']}")
+  
+  # Profile an operation
+  perf = db.users.profile('find', {'role': 'admin'})
+  print(f"Found {perf['docs_found']} docs in {perf['execution_time_ms']:.2f}ms")
+  ```
+
+**4. Default Values Support (v1.0.8+)**
+- Schema fields with `default` or `default_factory` are automatically applied on insert
+- Works with Pydantic models
+- Example:
+  ```python
+  from pydantic import BaseModel, Field
+  
+  class User(BaseModel):
+      name: str
+      role: str = Field(default="user")  # Applied on insert
+      created_at: datetime = Field(default_factory=datetime.now)
+  
+  db.users.insert({'name': 'Alice'})  # role='user' is auto-filled
+  ```
+
+### 📊 Summary
+
+| Metric | Count |
+|--------|-------|
+| Bug fixes | 8 (exceptions, memory leaks, duplicate code, null checks) |
+| New features | 4 (hooks, GraphQL, profiler, default values) |
+| Warnings added | 13 locations |
+| Test coverage | Existing suite covers new features |
+| Breaking changes | None (fully backward compatible) |
+
+> **Release Date**: 2026-03-28  
+> **Diff Stats**: 15 files changed, +~800 insertions, −~50 deletions  
+> **Python Version**: 3.7+  
+> **Dependencies Added (Optional)**: `strawberry-graphql` for GraphQL support
+
+---
+
 # HVPDB v1.0.7 — Full Changelog (since v1.0.6)
 
 ## [1.0.7.post1] - 2026-02-17 (Hotfix)

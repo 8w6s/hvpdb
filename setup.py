@@ -4,7 +4,7 @@ with open('README.md', 'r', encoding='utf-8') as fh:
 
 setup(
     name='hvpdb',
-    version='1.0.7.post1',
+    version='1.0.8',
     description='High Velocity Python Database (NoSQL, Embedded, Encrypted)',
     long_description=long_description,
     long_description_content_type='text/markdown',
@@ -26,6 +26,12 @@ setup(
     extras_require={
         'cli': ['typer>=0.9.0', 'rich>=13.0.0', 'prompt_toolkit>=3.0.0'],
         'server': ['fastapi>=0.100.0', 'uvicorn>=0.22.0'],
+        'graphql': ['strawberry-graphql>=0.200.0'],
+        'all': [
+            'typer>=0.9.0', 'rich>=13.0.0', 'prompt_toolkit>=3.0.0',
+            'fastapi>=0.100.0', 'uvicorn>=0.22.0',
+            'strawberry-graphql>=0.200.0'
+        ]
     },
     entry_points={
         'console_scripts': [

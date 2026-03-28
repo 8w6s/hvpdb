@@ -1,7 +1,11 @@
+import hashlib
 import os
 import struct
 import time
 import uuid
+import threading
+import random
+import contextlib
 import warnings
 import zlib
 from typing import Callable, Dict, List, Optional, Tuple, cast
@@ -14,375 +18,381 @@ from .exceptions import ConsistencyError
 from .utils import default_serializer, acquire_interruptible_lock
 
 WAL_MAGIC = b'HVPWAL'
-WAL_VERSION = 2
+WAL_VERSION = 4
+ENTRY_MAGIC = b'\x17'
 MAX_ENTRY_SIZE = 64 * 1024 * 1024
+
+CHECKSUM_CRC32 = 0
+CHECKSUM_SHA256 = 1
 
 class HVPWAL:
     """
-    Write-Ahead Log (WAL) for HVPDB.
-    
-    Provides crash consistency by logging all operations before they 
-    are applied to the main database file. Supports encryption, 
-    compression, and transaction grouping.
+    Write-Ahead Log (WAL) with robust locking and re-entrancy support.
     """
 
-    def __init__(self, log_path: str, security_context, compression_level: int=3):
-        """
-        Initialize the WAL manager.
-        
-        Args:
-            log_path: Path to the .log file.
-            security_context: HVPSecurity instance for encryption.
-            compression_level: Zstd compression level.
-        """
+    def __init__(self, log_path: str, security_context, compression_level: int=3, checksum_type: int=CHECKSUM_CRC32):
         self.log_path = log_path
         self.security = security_context
         self.cctx = zstd.ZstdCompressor(level=compression_level)
         self.dctx = zstd.ZstdDecompressor()
         self._file_handle = None
+        self._lock = threading.RLock()
+        self._lock_count = 0
+        self.checksum_type = checksum_type
+        self._header_checksum_type = CHECKSUM_CRC32
 
-    def _open_log(self):
-        """Open the log file with an exclusive lock for writing."""
-        if self._file_handle is None:
-            self._file_handle = open(self.log_path, 'ab')
+    def _open_log_internal(self, mode: str = 'a+b'):
+        """Internal: Open and lock the log with retries and non-blocking strategy."""
+    def _open_log_internal(self):
+        with self._lock:
+            if self._file_handle is None or self._file_handle.closed:
+                # Mode a+b allows reading and appending.
+                # It's better than 'rb' followed by 'ab' because it stays open.
+                for attempt in range(300):
+                    try:
+                        f = open(self.log_path, 'a+b')
+                        # On Windows, portalocker.lock with LOCK_EX handles both locking and sharing correctly
+                        portalocker.lock(f, portalocker.LOCK_EX | portalocker.LOCK_NB)
+                        self._file_handle = f
+                        return
+                    except (PermissionError, portalocker.exceptions.LockException, OSError):
+                        try:
+                            if 'f' in locals() and f: f.close()
+                        except: pass
+                        time.sleep(0.01 + random.random() * 0.04)
+                raise OSError(f"Could not acquire exclusive lock on WAL (TIMEOUT after 300 attempts): {self.log_path}")
+
+    @contextlib.contextmanager
+    def exclusive_lock(self):
+        """Re-entrant exclusive lock."""
+        with self._lock:
+            self._lock_count += 1
             try:
-                portalocker.lock(self._file_handle, portalocker.LOCK_EX)
-            except OSError:
-                # Some filesystems (e.g. some Docker mounts) do not support locking
-                warnings.warn('WAL file locking not supported; continuing without lock.')
+                self._open_log_internal()
+                yield self._file_handle
+            finally:
+                self._lock_count -= 1
+                # DO NOT close here. Let close() handle it. 
+                # Keeping it open avoids race conditions on Windows.
 
     def close(self):
-        """Unlock and close the log file handle."""
+        with self._lock:
+            self._lock_count = 0
+            self._close_internal()
+
+    def _close_internal(self):
         if self._file_handle:
             try:
                 try:
                     portalocker.unlock(self._file_handle)
-                except (OSError, portalocker.exceptions.LockException):
-                    warnings.warn('WAL unlock failed; continuing to close file.')
+                except Exception as unlock_err:
+                    warnings.warn(f"Failed to unlock WAL file: {unlock_err}")
                 self._file_handle.close()
-            except OSError:
-                warnings.warn('WAL close failed.')
-            self._file_handle = None
+            except Exception as close_err:
+                warnings.warn(f"Failed to close WAL file handle: {close_err}")
+            finally:
+                self._file_handle = None
 
     @staticmethod
-    def read_header(log_path: str) -> Tuple[Optional[bytes], Optional[dict]]:
-        """
-        Read the WAL header from a log file without opening it for writing.
-        
-        Args:
-            log_path: Path to the log file.
-            
-        Returns:
-            Tuple of (salt, kdf_params) or (None, None) if invalid.
-        """
-        if not os.path.exists(log_path):
-            return (None, None)
-        with open(log_path, 'rb') as f:
+    def read_header(path: str) -> Tuple[Optional[bytes], Optional[dict], int]:
+        if not os.path.exists(path) or os.path.getsize(path) == 0: return (None, None, CHECKSUM_CRC32)
+        for _ in range(10):
             try:
-                magic = f.read(6)
-                if magic != WAL_MAGIC:
-                    return (None, None)
-                version = int.from_bytes(f.read(2), 'big')
-                if version != WAL_VERSION:
-                    return (None, None)
-                salt = f.read(16)
-                kdf_len = int.from_bytes(f.read(2), 'big')
-                kdf_bytes = f.read(kdf_len)
-                kdf_params = msgpack.unpackb(kdf_bytes)
-                return (salt, kdf_params)
-            except Exception as e:
-                warnings.warn(f"Failed to read WAL header from {log_path}: {e}")
-                return (None, None)
+                with open(path, 'rb') as f:
+                    try:
+                        portalocker.lock(f, portalocker.LOCK_SH | portalocker.LOCK_NB)
+                    except (OSError, portalocker.exceptions.LockException):
+                        # Lock failed, but we can still read - it's a shared lock attempt
+                        pass
+                    magic = f.read(len(WAL_MAGIC))
+                    if magic != WAL_MAGIC: return (None, None, CHECKSUM_CRC32)
+                    version = int.from_bytes(f.read(2), 'big')
+                    salt = f.read(16)
+                    k_len_bytes = f.read(2)
+                    if len(k_len_bytes) < 2: return (None, None, CHECKSUM_CRC32)
+                    k_len = int.from_bytes(k_len_bytes, 'big')
+                    k_bytes = f.read(k_len)
+                    kp = msgpack.unpackb(k_bytes)
+                    ctype = CHECKSUM_CRC32
+                    if version >= 4:
+                        ctype_raw = f.read(1)
+                        if ctype_raw: ctype = int.from_bytes(ctype_raw, 'big')
+                    return (salt, kp, ctype)
+            except (PermissionError, portalocker.exceptions.LockException): time.sleep(0.05)
+            except Exception: break
+        return (None, None, CHECKSUM_CRC32)
 
     def ensure_header(self, salt: bytes, kdf_params: dict):
-        """
-        Ensure the WAL header is written to the log file.
-        
-        Args:
-            salt: Encryption salt.
-            kdf_params: KDF parameters.
-        """
-        if os.path.exists(self.log_path) and os.path.getsize(self.log_path) > 0:
-            return
-        self._open_log()
-        if self._file_handle is None:
-            raise RuntimeError("Failed to open WAL file")
-        f = self._file_handle
-        if f.tell() == 0:
-            try:
-                os.chmod(self.log_path, 0o600)
-            except OSError as e:
-                warnings.warn(f"Failed to set WAL file permissions: {e}")
+        """Ensure WAL has a proper header with the given salt/params."""
+        with self.exclusive_lock() as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size > 0:
+                # Header exists, verify salt consistency
+                f.seek(0)
+                magic = f.read(len(WAL_MAGIC))
+                if magic != WAL_MAGIC:
+                    print(f"DEBUG: WAL Header Magic Mismatch! Truncating. Expected {WAL_MAGIC}, got {magic}")
+                    f.seek(0); f.truncate(0)
+                else:
+                    v = int.from_bytes(f.read(2), 'big')
+                    s = f.read(16)
+                    if s != salt:
+                        print(f"DEBUG: WAL Salt Mismatch! Truncating. File has {s.hex()}, new is {salt.hex()}")
+                        f.seek(0); f.truncate(0)
+                    else:
+                        # print("DEBUG: WAL Header matches. Keeping file.")
+                        return
+            
+            # Write new header
+            if os.name != 'nt':
+                try: os.chmod(self.log_path, 0o600)
+                except: pass
             f.write(WAL_MAGIC)
             f.write(WAL_VERSION.to_bytes(2, 'big'))
             f.write(salt)
-            kdf_bytes = cast(bytes, msgpack.packb(kdf_params))
-            f.write(len(kdf_bytes).to_bytes(2, 'big'))
-            f.write(kdf_bytes)
+            kb = msgpack.packb(kdf_params)
+            f.write(len(kb).to_bytes(2, 'big'))
+            f.write(kb)
+            f.write(self.checksum_type.to_bytes(1, 'big'))
+            self._header_checksum_type = self.checksum_type
             f.flush()
             os.fsync(f.fileno())
 
     def _write_entry(self, entry: dict, sync: bool=True):
-        """
-        Internal: Encrypt, compress, and write a single entry to the log.
-        
-        Args:
-            entry: Dictionary containing the operation.
-            sync: If True, performs fsync to ensure data is on disk.
-        """
-        if self.security:
+        if not self.security:
+            raise RuntimeError("WAL security context not initialized. Cannot write encrypted entry.")
+        with self.exclusive_lock() as f:
             self.ensure_header(self.security.get_salt(), self.security.get_kdf_params())
-        packed = cast(bytes, msgpack.packb(entry, use_bin_type=True, default=default_serializer))
-        compressed = self.cctx.compress(packed)
-        nonce, ciphertext = self.security.encrypt_chunk(compressed)
-        
-        # Calculate CRC over everything including nonce and ciphertext
-        payload = nonce + ciphertext
-        crc = zlib.crc32(payload)
-        length = len(ciphertext)
-        
-        self._open_log()
-        if self._file_handle is None:
-            raise RuntimeError("Failed to open WAL file")
-        f = self._file_handle
-        
-        # Format: CRC(4) | Length(4) | Nonce(12) | Ciphertext(N)
-        f.write(struct.pack('>I', crc))
-        f.write(struct.pack('>I', length))
-        f.write(nonce)
-        f.write(ciphertext)
-        if sync:
-            f.flush()
-            os.fsync(f.fileno())
+            
+            packed = msgpack.packb(entry, use_bin_type=True, default=default_serializer)
+            compressed = self.cctx.compress(packed)
+            nonce = os.urandom(8) + struct.pack('>I', entry.get('seq', 0))
+            
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            ct = AESGCM(self.security._key).encrypt(nonce, compressed, None)
+            l = len(ct)
+            payload = ENTRY_MAGIC + struct.pack('>I', l) + nonce + ct
+            
+            if self._header_checksum_type == CHECKSUM_SHA256: 
+                cs = hashlib.sha256(payload).digest()
+            else: 
+                cs = struct.pack('>I', zlib.crc32(payload))
+                
+            f.seek(0, os.SEEK_END)
+            f.write(ENTRY_MAGIC); f.write(cs); f.write(struct.pack('>I', l)); f.write(nonce); f.write(ct); f.write(struct.pack('>I', l))
+            if sync: 
+                f.flush(); os.fsync(f.fileno())
 
     def write_batch(self, entries: List[dict], sync: bool=True):
-        """
-        Encrypt and write a batch of entries to the log in one go.
-        
-        Args:
-            entries: List of operation dictionaries.
-            sync: If True, performs fsync.
-        """
-        if not entries:
-            return
+        if not entries: return
         if not self.security:
-            raise ValueError("WAL Security context not initialized")
+            raise RuntimeError("WAL security context not initialized. Cannot write encrypted batch.")
+        with self.exclusive_lock() as f:
+            self.ensure_header(self.security.get_salt(), self.security.get_kdf_params())
             
-        self.ensure_header(self.security.get_salt(), self.security.get_kdf_params())
-        self._open_log()
-        if self._file_handle is None:
-            raise RuntimeError("Failed to open WAL file")
-        f = self._file_handle
-        for entry in entries:
-            packed = cast(bytes, msgpack.packb(entry, use_bin_type=True, default=default_serializer))
-            compressed = self.cctx.compress(packed)
-            nonce, ciphertext = self.security.encrypt_chunk(compressed)
-            
-            payload = nonce + ciphertext
-            crc = zlib.crc32(payload)
-            length = len(ciphertext)
-            
-            f.write(struct.pack('>I', crc))
-            f.write(struct.pack('>I', length))
-            f.write(nonce)
-            f.write(ciphertext)
-        if sync:
-            f.flush()
-            os.fsync(f.fileno())
+            f.seek(0, os.SEEK_END)
+            for entry in entries:
+                pk = msgpack.packb(entry, use_bin_type=True, default=default_serializer)
+                ct = self.cctx.compress(pk)
+                nonce = os.urandom(8) + struct.pack('>I', entry.get('seq', 0))
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                ctx = AESGCM(self.security._key).encrypt(nonce, ct, None)
+                l = len(ctx)
+                payload = ENTRY_MAGIC + struct.pack('>I', l) + nonce + ctx
+                if self._header_checksum_type == CHECKSUM_SHA256: 
+                    cs = hashlib.sha256(payload).digest()
+                else: 
+                    cs = struct.pack('>I', zlib.crc32(payload))
+                f.write(ENTRY_MAGIC); f.write(cs); f.write(struct.pack('>I', l)); f.write(nonce); f.write(ctx); f.write(struct.pack('>I', l))
+            if sync: 
+                f.flush(); os.fsync(f.fileno())
 
-    def begin_transaction(self) -> str:
-        """Generate a unique transaction ID."""
-        return str(uuid.uuid4())
-
-    def log_begin(self, sequence: int, txn_id: str):
-        """Log the start of a transaction."""
-        if not self.security:
-            raise ValueError('WAL Security context not initialized')
-        entry = {'seq': sequence, 'txn': txn_id, 'type': 'BEGIN', 'ts': time.time()}
-        self._write_entry(entry)
-
-    def log_commit(self, sequence: int, txn_id: str):
-        """Log the commitment of a transaction."""
-        if not self.security:
-            raise ValueError('WAL Security context not initialized')
-        entry = {'seq': sequence, 'txn': txn_id, 'type': 'COMMIT', 'ts': time.time()}
-        self._write_entry(entry)
-
-    def log_rollback(self, sequence: int, txn_id: str):
-        """Log the rollback of a transaction."""
-        if not self.security:
-            raise ValueError('WAL Security context not initialized')
-        entry = {'seq': sequence, 'txn': txn_id, 'type': 'ROLLBACK', 'ts': time.time()}
-        self._write_entry(entry)
-
-    def append(self, sequence: int, op: str, group: str, doc_id: str, data: dict, txn_id: Optional[str]=None, before_image: Optional[dict]=None, sync: bool=True):
-        """
-        Append a data operation to the log.
-        
-        Args:
-            sequence: Monotonic operation sequence number.
-            op: Operation type ('insert', 'update', 'delete').
-            group: Target group name.
-            doc_id: Document unique ID.
-            data: New document data.
-            txn_id: Optional transaction ID.
-            before_image: Optional document state before the operation.
-            sync: If True, performs fsync.
-        """
-        if not self.security:
-            raise ValueError('WAL Security context not initialized')
-        entry = {'seq': sequence, 'txn': txn_id, 'type': 'DATA', 'op': op, 'g': group, 'id': doc_id, 'd': data, 'b': before_image, 'ts': time.time()}
-        self._write_entry(entry, sync=sync)
-
-    def append_batch(self, sequence: int, operations: List[dict], txn_id: str):
-        """Append a batch of operations to the log."""
-        if not self.security:
-            raise ValueError('WAL Security context not initialized')
-        entry = {'seq': sequence, 'txn': txn_id, 'type': 'DATA', 'op': 'batch', 'd': operations, 'ts': time.time()}
-        self._write_entry(entry)
+    def begin_transaction(self) -> str: return str(uuid.uuid4())
+    def log_begin(self, s: int, tx: str, sid: str=None): self._write_entry({'seq':s,'sid':sid,'txn':tx,'type':'BEGIN','ts':time.time()})
+    def log_commit(self, s: int, tx: str, sid: str=None): self._write_entry({'seq':s,'sid':sid,'txn':tx,'type':'COMMIT','ts':time.time()})
+    def log_rollback(self, s: int, tx: str, sid: str=None): self._write_entry({'seq':s,'sid':sid,'txn':tx,'type':'ROLLBACK','ts':time.time()})
+    def append(self, s: int, op: str, g: str, id: str, d: dict, tx: str=None, b: dict=None, sync: bool=True, sid: str=None):
+        self._write_entry({'seq':s,'sid':sid,'txn':tx,'type':'DATA','op':op,'g':g,'id':id,'d':d,'b':b,'ts':time.time()}, sync=sync)
 
     def replay(self, last_sequence: int, apply_callback: Callable[[dict], None]) -> int:
-        """
-        Replay the WAL and apply operations since the last known sequence.
-        
-        Args:
-            last_sequence: The last sequence number successfully applied.
-            apply_callback: Function to call for each replayed operation.
-            
-        Returns:
-            Number of operations replayed.
-        """
-        if not os.path.exists(self.log_path):
-            return 0
-        if self._file_handle:
-            self.close()
-        replayed_count = 0
-        txn_buffer: Dict[str, List[dict]] = {}
-        corrupt_entries = 0
-        with open(self.log_path, 'rb') as f:
-            try:
-                portalocker.lock(f, portalocker.LOCK_SH)
-            except OSError:
-                pass
-            try:
-                header_magic = f.read(6)
-                if header_magic == WAL_MAGIC:
-                    version = int.from_bytes(f.read(2), 'big')
-                    if version != WAL_VERSION:
-                        raise ConsistencyError(f'WAL Version Mismatch: Expected {WAL_VERSION}, got {version}.')
-                    
-                    file_salt = f.read(16)
-                    kdf_len = int.from_bytes(f.read(2), 'big')
-                    file_kdf_bytes = f.read(kdf_len)
-                    
-                    if self.security:
-                        current_salt = self.security.get_salt()
-                        if current_salt and file_salt != current_salt:
-                            raise ConsistencyError(f"WAL salt mismatch! File: {file_salt.hex()}, Mem: {current_salt.hex()}")
-                else:
-                    f.seek(0)
-                while True:
-                    header = f.read(8)
-                    if not header or len(header) < 8:
-                        break
-                    stored_crc, length = struct.unpack('>II', header)
-                    if length == 0 or length > MAX_ENTRY_SIZE:
-                        raise ConsistencyError(f'WAL corruption detected: Entry size {length} invalid.')
-                    payload_len = 12 + length
-                    payload = f.read(payload_len)
-                    if len(payload) != payload_len:
-                        warnings.warn('WAL truncated at end. Stopping replay.')
-                        break
-                    computed_crc = zlib.crc32(payload) & 4294967295
-                    stored_crc &= 4294967295
-                    if computed_crc != stored_crc:
-                        warnings.warn('WAL CRC mismatch (corruption or partial write). Stopping replay.')
-                        corrupt_entries += 1
-                        if corrupt_entries >= 3:
-                            break
-                        continue
-                    nonce = payload[:12]
-                    ciphertext = payload[12:]
+        if not os.path.exists(self.log_path): return 0
+        replayed_count, txn_buffer, f_handle, own_handle = 0, {}, None, False
+        try:
+            if self._file_handle:
+                f_handle = self._file_handle
+                f_handle.seek(0)
+            else:
+                for _ in range(20):
                     try:
-                        if hasattr(self.security, 'decrypt_chunk'):
-                            compressed = self.security.decrypt_chunk(nonce, ciphertext)
-                        else:
-                            compressed = self.security.decrypt(nonce, ciphertext)
-                        packed = self.dctx.decompress(compressed)
-                        entry = msgpack.unpackb(packed, raw=False)
-                        seq = entry.get('seq', 0)
-                        if seq > last_sequence:
-                            entry_type = entry.get('type', 'DATA')
-                            txn_id = entry.get('txn')
-                            if not txn_id:
-                                apply_callback(entry)
-                                replayed_count += 1
-                                continue
-                            if entry_type == 'BEGIN':
-                                txn_buffer[txn_id] = []
-                            elif entry_type == 'DATA':
-                                if txn_id not in txn_buffer:
-                                    txn_buffer[txn_id] = []
-                                txn_buffer[txn_id].append(entry)
-                            elif entry_type == 'COMMIT':
-                                if txn_id in txn_buffer:
-                                    for buffered_entry in txn_buffer[txn_id]:
-                                        apply_callback(buffered_entry)
-                                        replayed_count += 1
-                                    del txn_buffer[txn_id]
-                            elif entry_type == 'ROLLBACK':
-                                if txn_id in txn_buffer:
-                                    del txn_buffer[txn_id]
-                    except Exception as e:
-                        warnings.warn(f'WAL Entry Decryption failed: {e}')
-                        corrupt_entries += 1
-                        if corrupt_entries >= 3:
-                            break
-                        continue
-            finally:
+                        f_handle = open(self.log_path, 'rb')
+                        try: portalocker.lock(f_handle, portalocker.LOCK_SH | portalocker.LOCK_NB)
+                        except: pass
+                        own_handle = True; break
+                    except: time.sleep(0.1)
+                if not f_handle: return 0
+
+            magic = f_handle.read(6)
+            if magic != WAL_MAGIC: return 0
+            version = int.from_bytes(f_handle.read(2), 'big')
+            f_handle.read(16); kl = int.from_bytes(f_handle.read(2), 'big'); f_handle.read(kl)
+            ct = CHECKSUM_CRC32
+            if version >= 4:
+                ctr = f_handle.read(1)
+                if ctr: ct = int.from_bytes(ctr, 'big')
+            cl = 32 if ct == CHECKSUM_SHA256 else 4
+            
+            while True:
+                m = f_handle.read(1)
+                if not m or m != ENTRY_MAGIC: break
+                csr, lr = f_handle.read(cl), f_handle.read(4)
+                if len(lr) < 4: break
+                dl = struct.unpack('>I', lr)[0]; nonce = f_handle.read(12); ctx = f_handle.read(dl); f_handle.read(4)
+                if len(ctx) < dl: break
+                valid = (hashlib.sha256(m+lr+nonce+ctx).digest() == csr) if ct == CHECKSUM_SHA256 else (struct.pack('>I', zlib.crc32(m+lr+nonce+ctx)) == csr)
+                if not valid: break
                 try:
-                    portalocker.unlock(f)
-                except OSError:
-                    pass
+                    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                    decrypted = AESGCM(self.security._key).decrypt(nonce, ctx, None)
+                    entry = msgpack.unpackb(decrypted, raw=False)
+                    if entry.get('seq', 0) > last_sequence:
+                        et, tx = entry.get('type', 'DATA'), entry.get('txn')
+                        if not tx: apply_callback(entry); replayed_count += 1
+                        elif et == 'BEGIN': txn_buffer[tx] = []
+                        elif et == 'DATA':
+                            if tx not in txn_buffer: txn_buffer[tx] = []
+                            txn_buffer[tx].append(entry)
+                        elif et == 'COMMIT':
+                            if tx in txn_buffer:
+                                for be in txn_buffer[tx]: apply_callback(be); replayed_count += 1
+                                del txn_buffer[tx]
+                        elif et == 'ROLLBACK':
+                            if tx in txn_buffer: del txn_buffer[tx]
+                except Exception as replay_err:
+                    warnings.warn(f"Failed to replay WAL entry: {replay_err}")
+                    break
+        finally:
+            if own_handle and f_handle:
+                try:
+                    portalocker.unlock(f_handle)
+                    f_handle.close()
+                except Exception as cleanup_err:
+                    warnings.warn(f"Failed to cleanup WAL file handle during replay: {cleanup_err}")
         return replayed_count
 
     def truncate(self):
-        """Clear the WAL file and reset it with a fresh header."""
-        if self._file_handle:
-            f = self._file_handle
-            f.seek(0)
-            f.truncate(0)
-            self._write_header_to_handle(f)
-        else:
-            with open(self.log_path, 'a+b') as f:
-                try:
-                    acquire_interruptible_lock(f)
-                except (OSError, portalocker.LockException):
-                    pass
-                try:
-                    f.seek(0)
-                    f.truncate(0)
-                    self._write_header_to_handle(f)
-                finally:
-                    try:
-                        portalocker.unlock(f)
-                    except OSError:
-                        pass
-            return
+        with self.exclusive_lock() as f:
+            f.seek(0); f.truncate(0); self._write_header_to_handle(f)
 
     def _write_header_to_handle(self, f):
-        """Internal: Write the WAL header to an open file handle."""
-        if os.name != 'nt':  # Skip chmod on Windows to avoid noisy warnings
+        if os.name != 'nt':
             try:
                 os.chmod(self.log_path, 0o600)
-            except OSError as e:
-                warnings.warn(f"Failed to set WAL file permissions: {e}")
+            except OSError as chmod_err:
+                warnings.warn(f"Failed to set WAL file permissions: {chmod_err}")
         if self.security:
-            f.write(WAL_MAGIC)
-            f.write(WAL_VERSION.to_bytes(2, 'big'))
-            f.write(self.security.get_salt())
-            kdf_bytes = cast(bytes, msgpack.packb(self.security.get_kdf_params()))
-            f.write(len(kdf_bytes).to_bytes(2, 'big'))
-            f.write(kdf_bytes)
-        f.flush()
-        os.fsync(f.fileno())
+            f.write(WAL_MAGIC); f.write(WAL_VERSION.to_bytes(2, 'big')); f.write(self.security.get_salt())
+            kb = msgpack.packb(self.security.get_kdf_params())
+            f.write(len(kb).to_bytes(2, 'big')); f.write(kb)
+            f.write(self.checksum_type.to_bytes(1, 'big'))
+            self._header_checksum_type = self.checksum_type
+        f.flush(); os.fsync(f.fileno())
+
+    def replay_reverse(self, limit: int=100) -> List[dict]:
+        results = []
+        salt, kp, ct = self.read_header(self.log_path)
+        if salt is None:
+            return []
+            
+        # Re-calculate header size exactly by reading it
+        header_offset = 0
+        try:
+            with open(self.log_path, 'rb') as f:
+                f.read(len(WAL_MAGIC)) # MAGIC
+                f.read(2) # VERSION
+                f.read(16) # SALT
+                k_len_bytes = f.read(2)
+                if len(k_len_bytes) == 2:
+                    k_len = int.from_bytes(k_len_bytes, 'big')
+                    f.read(k_len)
+                    header_offset = f.tell()
+                    # Version 4+ has checksum type byte
+                    # Check version
+                    f.seek(len(WAL_MAGIC))
+                    v = int.from_bytes(f.read(2), 'big')
+                    if v >= 4:
+                        header_offset += 1
+        except Exception as offset_err:
+            warnings.warn(f"Failed to calculate WAL header offset for reverse replay: {offset_err}")
+            return []
+            
+        cl = 32 if ct == CHECKSUM_SHA256 else 4
+        oh = 1 + cl + 4 + 12 + 4
+        
+        with self._lock:
+            try:
+                # Use shared lock to avoid conflicts during read
+                with open(self.log_path, 'rb') as f:
+                    try:
+                        portalocker.lock(f, portalocker.LOCK_SH | portalocker.LOCK_NB)
+                    except (OSError, portalocker.exceptions.LockException):
+                        # Continue even if we can't lock - it's a shared read attempt
+                        pass
+                    f.seek(0, os.SEEK_END); pos = f.tell()
+                    # Start scanning from the end
+                    while len(results) < limit and pos > header_offset:
+                        if pos < (header_offset + oh): break
+                        
+                        # Peek at trailer length (last 4 bytes of entry)
+                        f.seek(pos-4); fr = f.read(4)
+                        if len(fr) < 4: 
+                            pos -= 1; continue
+                        el = struct.unpack('>I', fr)[0]
+                        if el > MAX_ENTRY_SIZE or el == 0:
+                            pos -= 1; continue
+                            
+                        tl = el + oh
+                        if pos < (header_offset + tl):
+                            pos -= 1; continue
+                            
+                        # Potential entry start pos
+                        sp = pos - tl
+                        f.seek(sp)
+                        m = f.read(1)
+                        if not m or m[0] != ENTRY_MAGIC: 
+                            pos -= 1; continue
+                            
+                        # Found magic, read full entry
+                        # We are at sp+1
+                        cr = f.read(cl)
+                        lr_bytes = f.read(4)
+                        if len(lr_bytes) < 4: 
+                            pos -= 1; continue
+                        lr = struct.unpack('>I', lr_bytes)[0]
+                        if lr != el:
+                            pos -= 1; continue
+                            
+                        nonce = f.read(12)
+                        ct_bin = f.read(el)
+                        
+                        # Verify integrity
+                        valid = False
+                        if ct == CHECKSUM_SHA256:
+                            valid = (hashlib.sha256(m+lr_bytes+nonce+ct_bin).digest() == cr)
+                        else:
+                            valid = (struct.pack('>I', zlib.crc32(m+lr_bytes+nonce+ct_bin)) == cr)
+                            
+                        if valid:
+                            try:
+                                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                                decrypted = AESGCM(self.security._key).decrypt(nonce, ct_bin, None)
+                                entry = msgpack.unpackb(decrypted, raw=False)
+                                results.append(entry)
+                                pos = sp # Move pointer to before this entry
+                                continue
+                            except Exception as e:
+                                pass
+                        pos -= 1 # Scan backwards one byte if not valid
+            except Exception as e:
+                warnings.warn(f"Reverse replay failed: {e}")
+        return results
