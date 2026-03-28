@@ -1143,14 +1143,14 @@ class HVPGroup:
         }
         
         try:
-            /* Measure baseline memory before operation. sys.getsizeof() gives
-               size of the group storage structure. We use this as a proxy for
-               total memory usage since deep measurement is expensive. */
+            # Measure baseline memory before operation. sys.getsizeof() gives
+            # the size of the group storage structure. We use this as a proxy
+            # for total memory usage because deep measurement is expensive.
             start_mem = sys.getsizeof(self.storage.data['groups'][self.name])
             op_start = time.time()
             
-            /* Execute the requested operation. Each branch updates the result
-               dict with operation-specific metrics (docs affected count). */
+            # Execute the requested operation. Each branch updates the result
+            # dict with operation-specific metrics (docs affected count).
             if operation == 'find':
                 res = list(self.find_iter(query))
                 result['docs_found'] = len(res)
@@ -1168,8 +1168,8 @@ class HVPGroup:
             else:
                 raise ValueError(f"Unknown operation: {operation}")
             
-            /* Measure post-operation state. Calculate elapsed time in
-               milliseconds and memory delta. */
+            # Measure post-operation state. Calculate elapsed time in
+            # milliseconds and memory delta.
             op_time = (time.time() - op_start) * 1000
             end_mem = sys.getsizeof(self.storage.data['groups'][self.name])
             

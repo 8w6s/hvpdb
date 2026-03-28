@@ -621,7 +621,7 @@ Docs in Group: {docs_in_group}"""
                 if HAS_PROMPT_TOOLKIT and self._prompt_session:
                     line = self._prompt_session.prompt(self.prompt)
                 elif self.use_rawinput:
-                    line = console.input(self.prompt)
+                    line = input(self.prompt)
                 else:
                     self.stdout.write(self.prompt)
                     line = self.stdin.readline()

@@ -50,10 +50,11 @@ class HVPURI:
         Raises:
             ValueError: If the URI scheme is invalid.
         """
-        if not uri.startswith('hvp://'):
-            raise ValueError('Invalid Scheme. Must start with hvp://')
+        if not (uri.startswith('hvp://') or uri.startswith('hvpdb://')):
+            raise ValueError('Invalid Scheme. Must start with hvp:// or hvpdb://')
         
-        rest = uri[6:]
+        prefix_len = 6 if uri.startswith('hvp://') else 8
+        rest = uri[prefix_len:]
         username = None
         password = None
         
@@ -70,6 +71,9 @@ class HVPURI:
             
         if '/' in rest:
             host_part, path_query = rest.split('/', 1)
+        elif '?' in rest:
+            host_part, path_query = rest.split('?', 1)
+            path_query = '?' + path_query # Re-add ? for the path_query logic below
         else:
             host_part = rest
             path_query = ''
@@ -84,15 +88,22 @@ class HVPURI:
             
         database = ''
         options = {}
-        if '?' in path_query:
+        if path_query.startswith('?'):
+             database = 'default'
+             query_part = path_query[1:]
+             for pair in query_part.split('&'):
+                if '=' in pair:
+                    k, v = pair.split('=', 1)
+                    options[urllib.parse.unquote(k)] = urllib.parse.unquote(v)
+        elif '?' in path_query:
             path_part, query_part = path_query.split('?', 1)
-            database = path_part
+            database = urllib.parse.unquote(path_part)
             for pair in query_part.split('&'):
                 if '=' in pair:
                     k, v = pair.split('=', 1)
-                    options[k] = v
+                    options[urllib.parse.unquote(k)] = urllib.parse.unquote(v)
         else:
-            database = path_query
+            database = urllib.parse.unquote(path_query)
             
         if not database:
             database = 'default'

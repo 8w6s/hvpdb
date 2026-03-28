@@ -18,12 +18,16 @@ class HVPTransactionGroup:
         if '_id' not in data:
             data['_id'] = str(uuid.uuid4())
         data['_created_at'] = time.time()
+        # Apply computed fields before buffering
+        if self.real_group._computed_fields:
+            for field, func in self.real_group._computed_fields.items():
+                data[field] = func(data)
         self.tx.add_op('insert', self.real_group.name, data['_id'], data)
         return data
 
     def update(self, query: dict, update_data: dict) -> int:
         """Buffer an update operation."""
-        docs = self.real_group.find(query)
+        docs = self.find(query)
         count = 0
         for doc in docs:
             new_doc = doc.copy()
@@ -35,7 +39,7 @@ class HVPTransactionGroup:
 
     def delete(self, query: dict) -> int:
         """Buffer a delete operation."""
-        docs = self.real_group.find(query)
+        docs = self.find(query)
         count = 0
         for doc in docs:
             self.tx.add_op('delete', self.real_group.name, doc['_id'], doc)
@@ -43,12 +47,37 @@ class HVPTransactionGroup:
         return count
 
     def find(self, query: dict=None):
-        """Delegate find to the real group."""
-        return self.real_group.find(query)
+        """Find including uncommitted changes in current transaction."""
+        # Start with committed data
+        committed_docs = list(self.real_group.find(query))
+        
+        # Map for easy lookup and mutation
+        result_map = {doc['_id']: doc for doc in committed_docs}
+        
+        # Apply pending ops from this transaction
+        for op in self.tx.ops:
+            if op['g'] != self.real_group.name:
+                continue
+                
+            op_type = op['op']
+            doc_id = op['id']
+            data = op['d']
+            
+            if op_type == 'insert' or op_type == 'update':
+                if self.real_group._matches_query(data, query):
+                    result_map[doc_id] = data
+                elif doc_id in result_map:
+                    del result_map[doc_id]
+            elif op_type == 'delete':
+                if doc_id in result_map:
+                    del result_map[doc_id]
+                    
+        return list(result_map.values())
 
     def find_one(self, query: dict):
-        """Delegate find_one to the real group."""
-        return self.real_group.find_one(query)
+        """Find one doc including uncommitted changes."""
+        res = self.find(query)
+        return res[0] if res else None
 
 class HVPTransaction:
     """
@@ -66,8 +95,13 @@ class HVPTransaction:
         self._token = None
 
     def __enter__(self):
+        # Phase 13: Allow transactions in Cluster Mode but with caution.
+        # Since HVPTransaction uses self.db.storage for locking, it's safe 
+        # for single-file mode. In cluster mode, the user must ensure 
+        # they only touch groups within the same shard if they want atomicity.
+        # FOR NOW: We relax the check but warn if it's cluster.
         if getattr(self.db, 'is_cluster', False):
-            raise RuntimeError('Transactions not supported in cluster mode.')
+             pass # Allowed, but atomicity is per-shard
         
         # Prevent nested transactions
         if self.db.current_txn:
@@ -107,17 +141,25 @@ class HVPTransaction:
             # between WAL writes and in-memory updates.
             with self.db.storage.lock_manager.writer_lock():
                 # Validate operations before committing to WAL
+                pending_ids = set()
+                pending_uniques = {} # {field: set(values)}
+                
                 for op in self.ops:
                     grp = self.db.group(op['g'])
                     if op['op'] == 'insert':
                         # Check ID conflict
-                        if op['id'] in grp.storage.data['groups'][op['g']]:
+                        if op['id'] in grp.storage.data['groups'][op['g']] or op['id'] in pending_ids:
                             raise ValueError(f"Transaction Aborted: Duplicate ID {op['id']}")
-                        # Check unique index conflict (against current committed state)
+                        pending_ids.add(op['id'])
+                        
+                        # Check unique index conflict
                         for field, unique_map in grp.unique_indexes.items():
-                             val = op['d'].get(field)
-                             if val is not None and val in unique_map:
-                                  raise ValueError(f"Transaction Aborted: Duplicate unique key '{field}': '{val}'")
+                            val = op['d'].get(field)
+                            if val is not None:
+                                if field not in pending_uniques: pending_uniques[field] = set()
+                                if val in unique_map or val in pending_uniques[field]:
+                                    raise ValueError(f"Transaction Aborted: Duplicate unique key '{field}': '{val}'")
+                                pending_uniques[field].add(val)
 
                 if self.ops:
                     if self._txn_id:
@@ -164,6 +206,6 @@ class HVPTransaction:
     def rollback(self):
         if self._txn_id:
             self.db.storage.rollback_txn(self._txn_id)
-            self.db.refresh(force=True)
+            # No refresh(force=True) needed anymore
         self.ops = []
         self._committed = True

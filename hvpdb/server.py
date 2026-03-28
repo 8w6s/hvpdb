@@ -58,7 +58,7 @@ def get_auth(authorization: Optional[str]=Header(None), x_hvp_key: Optional[str]
 @app.get('/')
 def read_root():
     """Health check endpoint."""
-    return {'server': 'HVPDB', 'status': 'running', 'version': '1.0.3.dev1'}
+    return {'server': 'HVPDB', 'status': 'running', 'version': '1.0.8'}
 
 @app.get('/groups', dependencies=[Depends(get_auth)])
 def list_groups():
@@ -179,10 +179,10 @@ def _setup_graphql_api():
         return
     
     try:
-        /* Build dynamic GraphQL types from database groups. The Query type
-           defines the entry points clients can use. We use Strawberry's
-           @strawberry.type and @strawberry.field decorators to build
-           the schema from Python code rather than SDL strings. */
+        # Build dynamic GraphQL types from database groups. The Query type
+        # defines the entry points clients can use. We use Strawberry's
+        # @strawberry.type and @strawberry.field decorators to build
+        # the schema from Python code rather than SDL strings.
         @strawberry.type
         class Query:
             @strawberry.field
@@ -204,21 +204,19 @@ def _setup_graphql_api():
                     query = json.loads(query_json) if query_json else {}
                     grp = db_instance.group(group_name)
                     docs = grp.find(query)
-                    /* Convert HVPDocument objects to plain dicts for GraphQL serialization.
-                       HVPDocument wraps dicts with special methods, but GraphQL needs
-                       JSON-serializable dictionaries. */
+                    # Convert HVPDocument objects to plain dicts for GraphQL
+                    # serialization. GraphQL needs JSON-serializable values.
                     return [dict(d) for d in docs]
                 except Exception as e:
                     warnings.warn(f"GraphQL query failed: {e}")
                     return []
         
-        /* Create the Strawberry schema from the Query type. This validates
-           the schema at startup and catches definition errors early. */
+        # Create the Strawberry schema from the Query type. This validates
+        # the schema at startup and catches definition errors early.
         schema = strawberry.Schema(query=Query)
         
-        /* Mount the GraphQL endpoint at /graphql on the FastAPI app.
-           Strawberry provides a GraphQLRouter that handles GraphQL protocol
-           (query/mutation/subscription over HTTP/WebSocket). */
+        # Mount the GraphQL endpoint at /graphql on the FastAPI app.
+        # Strawberry provides GraphQL protocol handling over HTTP/WebSocket.
         graphql_router = GraphQLRouter(schema, path="/graphql")
         app.include_router(graphql_router)
         

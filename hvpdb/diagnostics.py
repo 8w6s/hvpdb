@@ -57,7 +57,7 @@ class Diagnostics:
             
         if report['wal_exists']:
             try:
-                salt, kdf = HVPWAL.read_header(self.wal_path)
+                salt, kdf, _ = HVPWAL.read_header(self.wal_path)
                 report['wal_header'] = 'v2' if salt else 'legacy/missing'
             except Exception as e:
                 report['issues'].append(f'WAL Read Error: {e}')
@@ -107,23 +107,35 @@ class Diagnostics:
                     
                 while True:
                     current_pos = f.tell()
-                    header = f.read(8)
-                    if not header or len(header) < 8:
-                        break
                     
-                    seq, length = struct.unpack('>II', header)
+                    peak_bytes = f.read(1)
+                    if not peak_bytes: break
+                    
+                    if peak_bytes == b'\xBB':
+                        # WAL V3
+                        header = f.read(8) # CRC(4) + Length(4)
+                        if not header or len(header) < 8: break
+                        crc, length = struct.unpack('>II', header)
+                        # Skip Nonce(12) + Ciphertext(length)
+                        skip_offset = 12 + length
+                    else:
+                        # Legacy/V2 (No magic) / Peek was part of the header
+                        f.seek(current_pos)
+                        header = f.read(8)
+                        if not header or len(header) < 8: break
+                        seq, length = struct.unpack('>II', header)
+                        skip_offset = length + 4 # Data + Checksum
+                        stats['last_seq'] = seq
+                    
                     if length == 0 or length > MAX_ENTRY_SIZE:
                         stats['corrupt'] = True
                         break
                     
-                    # Verify if we can actually seek to the end of this entry
                     try:
-                        f.seek(length + 4, 1) # Skip data (length) + checksum (4)
+                        f.seek(f.tell() + skip_offset)
                         stats['entries'] += 1
-                        stats['last_seq'] = seq
                     except (OSError, ValueError):
                         stats['corrupt'] = True
-                        f.seek(current_pos)
                         break
         except Exception as e:
             warnings.warn(f"WAL scan error for {self.wal_path}: {e}")
@@ -147,7 +159,7 @@ class Diagnostics:
             raise ValueError('Password required to dump WAL.')
             
         from .security import HVPSecurity
-        salt, kdf_params = HVPWAL.read_header(self.wal_path)
+        salt, kdf_params, _ = HVPWAL.read_header(self.wal_path)
         
         if not salt:
             security = HVPSecurity(self.password)
@@ -231,9 +243,10 @@ class Diagnostics:
         import shutil
         
         try:
-            salt, kdf_params = HVPWAL.read_header(self.wal_path)
+            salt, kdf_params, original_checksum_type = HVPWAL.read_header(self.wal_path)
         except Exception:
             salt = None
+            original_checksum_type = 0 # Default to CRC32
             
         if not salt:
              # Header corrupt? Cannot decrypt.
@@ -255,7 +268,7 @@ class Diagnostics:
             
         # Create new WAL
         new_wal_path = self.wal_path + '.repaired'
-        new_wal = HVPWAL(new_wal_path, security)
+        new_wal = HVPWAL(new_wal_path, security, checksum_type=original_checksum_type)
         new_wal.ensure_header(salt, kdf_params)
         
         # Write valid entries

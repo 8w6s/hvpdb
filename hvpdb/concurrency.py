@@ -74,7 +74,6 @@ class HVPLockManager:
         Yields:
             None
         """
-        print(f"[LOCK DEBUG] Acquiring writer lock on {self.write_lock_path}...")
         try:
              fd = os.open(self.write_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
              f = os.fdopen(fd, 'r+')
@@ -87,7 +86,6 @@ class HVPLockManager:
             while True:
                 try:
                     portalocker.lock(f, portalocker.LOCK_EX | portalocker.LOCK_NB)
-                    print(f"[LOCK DEBUG] Acquired writer lock.")
                     break
                 except (OSError, portalocker.exceptions.LockException) as e:
                     if self.is_termux:
@@ -96,13 +94,11 @@ class HVPLockManager:
                     delay = min(delay * 2, 0.5)
             yield
         finally:
-            print(f"[LOCK DEBUG] Releasing writer lock...")
             try:
                 portalocker.unlock(f)
             except (OSError, portalocker.exceptions.LockException) as e:
                 warnings.warn(f"Failed to unlock: {e}")
             f.close()
-            print(f"[LOCK DEBUG] Released writer lock.")
 
     @contextmanager
     def critical_swap_lock(self):
