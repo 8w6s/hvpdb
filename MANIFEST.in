@@ -6,3 +6,5 @@ include TRADEMARK.md
 recursive-include hvpdb *.py
 recursive-exclude * __pycache__
 recursive-exclude * *.py[co]
+recursive-exclude * desktop.ini
+global-exclude desktop.ini
