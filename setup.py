@@ -8,9 +8,11 @@ setup(
     description='High Velocity Python Database (NoSQL, Embedded, Encrypted)',
     long_description=long_description,
     long_description_content_type='text/markdown',
+    license='Apache-2.0',
     author='HVPDB Bot',
     author_email='satoharuki2321@proton.me',
     packages=find_packages(),
+    include_package_data=True,
     install_requires=[
         'cryptography>=41.0.0',
         'msgpack>=1.0.5',
@@ -38,10 +40,13 @@ setup(
             'hvpdb=hvpdb.cli:app'
         ]
     },
+    project_urls={
+        'Source': 'https://github.com/8w6s/hvpdb',
+        'Issues': 'https://github.com/8w6s/hvpdb/issues',
+    },
     classifiers=[
         'Development Status :: 4 - Beta',
         'Intended Audience :: Developers',
-        'License :: OSI Approved :: Apache Software License',
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
